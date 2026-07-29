@@ -350,6 +350,80 @@ test("currentClaudeSession does not fall back to process.env when options.env is
   assert.equal(snapshot.jobs[0].id, "task-other-session");
 });
 
+test("buildStatusSnapshot treats --all and --limit as orthogonal", (t) => {
+  const { repo } = withStateHome(t);
+  const sessionA = "claude-session-a";
+  const sessionB = "claude-session-b";
+  // 10 jobs in the current session + 2 from another session, newest first by updatedAt.
+  const jobs = [];
+  for (let index = 0; index < 10; index += 1) {
+    const n = String(index + 1).padStart(2, "0");
+    jobs.push({
+      id: `task-a-${n}`,
+      kind: "task",
+      status: "completed",
+      phase: "completed",
+      claudeSessionId: sessionA,
+      summary: `session a job ${n}`,
+      updatedAt: `2026-07-30T10:${String(index).padStart(2, "0")}:00.000Z`
+    });
+  }
+  jobs.push(
+    {
+      id: "task-b-01",
+      kind: "task",
+      status: "completed",
+      phase: "completed",
+      claudeSessionId: sessionB,
+      summary: "session b job 01",
+      updatedAt: "2026-07-30T11:00:00.000Z"
+    },
+    {
+      id: "task-b-02",
+      kind: "task",
+      status: "completed",
+      phase: "completed",
+      claudeSessionId: sessionB,
+      summary: "session b job 02",
+      updatedAt: "2026-07-30T11:01:00.000Z"
+    }
+  );
+  seedJobs(repo, jobs);
+  const env = {
+    GROK_COMPANION_HOME: process.env.GROK_COMPANION_HOME,
+    GROK_COMPANION_CLAUDE_SESSION_ID: sessionA
+  };
+
+  // Neither: current session only, default cap of 8.
+  const neither = buildStatusSnapshot(repo, { env });
+  assert.equal(neither.jobs.length, 8);
+  assert.equal(neither.filters.all, false);
+  assert.equal(neither.filters.limit, 8);
+  assert.ok(neither.jobs.every((job) => job.claudeSessionId === sessionA));
+
+  // --limit alone: current session, explicit cap.
+  const limitOnly = buildStatusSnapshot(repo, { env, maxJobs: 2 });
+  assert.equal(limitOnly.jobs.length, 2);
+  assert.equal(limitOnly.filters.all, false);
+  assert.equal(limitOnly.filters.limit, 2);
+  assert.ok(limitOnly.jobs.every((job) => job.claudeSessionId === sessionA));
+
+  // --all alone: every session, no default cap (legacy "show everything").
+  const allOnly = buildStatusSnapshot(repo, { env, all: true });
+  assert.equal(allOnly.jobs.length, 12);
+  assert.equal(allOnly.filters.all, true);
+  assert.equal(allOnly.filters.limit, null);
+  assert.ok(allOnly.jobs.some((job) => job.claudeSessionId === sessionB));
+
+  // --all --limit: every session, still capped by limit.
+  const both = buildStatusSnapshot(repo, { env, all: true, maxJobs: 2 });
+  assert.equal(both.jobs.length, 2);
+  assert.equal(both.filters.all, true);
+  assert.equal(both.filters.limit, 2);
+  // Newest across all sessions are the two session-B jobs.
+  assert.deepEqual(both.jobs.map((job) => job.id), ["task-b-02", "task-b-01"]);
+});
+
 test("progressPreview reads only the log tail for large files", (t) => {
   const root = tempDir();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

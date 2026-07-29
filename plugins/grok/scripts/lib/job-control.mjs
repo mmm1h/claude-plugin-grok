@@ -460,8 +460,13 @@ export function buildStatusSnapshot(cwd, options = {}) {
     sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot, options), options)),
     options
   );
-  const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
-  const selected = options.all ? jobs : jobs.slice(0, maxJobs);
+  // --all only opens session scope. --limit (or the session-mode default of 8)
+  // always caps the listed jobs. Bare --all with no explicit maxJobs stays
+  // unlimited so existing "show everything" callers keep their default.
+  const maxJobs = options.maxJobs != null
+    ? options.maxJobs
+    : (options.all ? null : DEFAULT_MAX_STATUS_JOBS);
+  const selected = maxJobs == null ? jobs : jobs.slice(0, maxJobs);
   const running = jobs
     .filter((job) => ["queued", "running"].includes(job.status))
     .map((job) => enrichJob(job, enrichOptions));
@@ -480,7 +485,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
     filters: {
       kind: options.kind ?? null,
       status: options.status ?? null,
-      limit: options.all ? null : maxJobs,
+      limit: maxJobs,
       all: Boolean(options.all)
     }
   };

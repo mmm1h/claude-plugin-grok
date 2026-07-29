@@ -1,6 +1,6 @@
 ---
 description: Run a read-only Grok review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--timeout-ms <ms>] [--json] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -16,7 +16,7 @@ Core constraint:
 - Return the companion's rendered review output verbatim.
 - The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call only if evidence was truly truncated.
 - Reviews of at most 2 changed files and at most 256 KiB of tracked diff are sent inline. Larger reviews use status, changed paths, diff stat, and explicit self-collection through the unchanged read-only tool allowlist; general shell access remains unavailable.
-- Branch self-collection fails closed when uncommitted changes would contaminate direct file evidence for the selected range.
+- **Dirty working tree + branch self-collect:** same as `/grok:review` — prefer the clean commit-range diff when the tree is dirty; fail closed only when that clean evidence still exceeds the budget.
 
 Execution mode:
 - Honor explicit `--wait` or `--background` without asking.
@@ -30,6 +30,10 @@ Argument handling:
 - Preserve all arguments and focus text exactly.
 - This uses the same target selection as `/grok:review`.
 - Supported scopes are `auto`, `working-tree`, and `branch`; `--base <ref>` selects branch review.
+- `--model <id>` overrides the Grok model for this review.
+- `--timeout-ms <ms>` overrides the Grok process timeout (default is the companion's 1-hour headless timeout when omitted).
+- `--json` selects structured JSON output instead of the rendered Markdown report.
+- Choose either `--wait` or `--background`, not both.
 
 Foreground:
 ```bash

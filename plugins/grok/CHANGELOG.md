@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.5.0 - 2026-07-30
+
+### Stability
+
+- Resolved the Grok binary on Windows so npm `.cmd` shims start without a
+  shell; prefers `.exe`, and runs `.cmd`/`.bat` via `ComSpec /d /s /c` with
+  explicit quoting while keeping `shell:false` so prompts never land on a
+  command line.
+- Stopped leaking orphaned Grok processes: foreground runs no longer detach,
+  SIGINT/SIGTERM terminate the process tree, and cancel kills the whole tree
+  via process group plus `pgrep` fallback.
+- Guarded against PID reuse with optional name/start-time verification.
+- Gave each job file its own lock and compare-and-swap writes so terminal
+  states cannot be rolled back by a late progress or completion write.
+- Throttled progress writes, skipped silent token-level events, and swallowed
+  log I/O errors so a locked or full disk cannot abort a job.
+- Lock files now carry token and pid, support renewal, and use liveness rather
+  than mtime alone to detect staleness.
+- Backed up and rebuilt a corrupt `state.json` instead of silently emptying it
+  (which previously let prune delete live job files).
+
+### Compatibility
+
+- Forced git UTF-8 output (`core.quotepath=false`,
+  `i18n.logOutputEncoding=utf-8`) so non-ASCII paths and diffs survive a GBK
+  console.
+- Estimated diff size with `numstat`, raw gitlink detection, and on-disk size
+  bounds instead of materializing a full binary diff just to test a threshold.
+- Fell back to a clean commit-range diff when the working tree is dirty under
+  branch scope, with actionable guidance when even that exceeds budget.
+- Probed `grok --version`, enforced a minimum supported version, and reported
+  missing flags so a CLI upgrade fails fast.
+- Auth detection accepts credential files and `config.toml` `env_key` variables
+  (third-party gateway style) without ever emitting secret values.
+
+### Features
+
+- Added `logs`, `cleanup`, `export`, and `rerun` job lifecycle commands.
+- Task and resume gained `--session-id` and `--resume-job` (including cross
+  Claude session), and empty-prompt resume now injects a continue prompt.
+- `review`, `adversarial-review`, and `transfer` accept `--timeout-ms`;
+  `transfer` supports `--background`.
+- `status` supports `--kind`, `--status`, `--limit`, `--progress-lines`,
+  `--poll-interval-ms`, and `--with-result`; `result` supports `--wait`;
+  wait timeouts exit `124`.
+- `cancel --all [--kind]` cancels active jobs in parallel.
+- `usage()` now matches the real argument surface, including `--stop-review`.
+- Fixed `status --all --limit N`: `--all` only opens session scope, and
+  `--limit` always caps the listing. Bare `--all` (no `--limit`) remains
+  unlimited; session mode without `--limit` still defaults to 8.
+
+### Tests
+
+- Grew coverage from 78 to 157+ cases.
+- `fake-grok` can split stdout into chunks, exit mid-stream, flood stderr, and
+  exit non-zero with a valid body so streaming regressions stay reproducible.
+
 ## 0.4.2 - 2026-07-29
 
 - Fixed structured review parsing when a Grok JSON envelope's `text` field

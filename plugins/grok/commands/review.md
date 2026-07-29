@@ -1,6 +1,6 @@
 ---
 description: Run a read-only Grok code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--timeout-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -16,7 +16,7 @@ Core constraint:
 - Return the companion's rendered review output verbatim to the user.
 - The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call only if evidence was truly truncated.
 - Reviews of at most 2 changed files and at most 256 KiB of tracked diff are sent inline. Larger reviews use self-collect mode: Grok receives status, changed paths, diff stat, and explicit instructions to inspect relevant files with its existing read-only tools. General shell access is never enabled.
-- Branch self-collection fails closed when the working tree is dirty, because direct file reads would not faithfully represent the selected commit range.
+- **Dirty working tree + branch self-collect:** when branch review needs self-collection and the tree is dirty, the companion first embeds the **clean commit-range** diff (unaffected by uncommitted edits) and warns Grok not to treat working-tree file reads as authoritative. Only if that clean range still exceeds the evidence budget does the review fail closed with recovery options (`--scope working-tree`, stash/commit then re-run, or narrow the range).
 
 Execution mode:
 - If the arguments include `--wait`, run in the foreground without asking.
@@ -31,6 +31,11 @@ Execution mode:
 Argument handling:
 - Preserve the user's arguments exactly.
 - `/grok:review` does not accept focus text. Use `/grok:adversarial-review` for custom focus.
+- Supported scopes are `auto`, `working-tree`, and `branch`; `--base <ref>` selects branch review.
+- `--model <id>` overrides the Grok model for this review.
+- `--timeout-ms <ms>` overrides the Grok process timeout (default is the companion's 1-hour headless timeout when omitted).
+- `--json` selects structured JSON output instead of the rendered Markdown report.
+- Choose either `--wait` or `--background`, not both.
 - The companion enforces both a read-only Grok sandbox and a read-only tool set.
 
 Foreground:

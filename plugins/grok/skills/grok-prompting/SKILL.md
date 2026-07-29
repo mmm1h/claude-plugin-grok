@@ -53,6 +53,18 @@ Omit a block only when it would be empty or duplicate an explicit user
 contract. Do not add decorative tags, generic role-play, or requests to "think
 harder." Better evidence and completion rules are more useful than verbosity.
 
+## Prompt size and `--prompt-file`
+
+- Prefer a tight envelope over a long narrative. Most rescue prompts should fit
+  comfortably on the command line.
+- When the user already supplied `--prompt-file`, or the tightened body would be
+  large (multi-thousand lines, bulk logs, pasted diffs), pass
+  `--prompt-file <path>` to companion `task` instead of argv text.
+- Hard limit is **16 MiB UTF-8** for argv, stdin, or `--prompt-file`. Do not
+  invent a path; only forward a path the user (or slash command) provided, or
+  keep the prompt short enough for argv.
+- Do not re-expand a prompt file into the Bash command line.
+
 ## Scenario Guidance
 
 ### Coding
@@ -93,9 +105,12 @@ harder." Better evidence and completion rules are more useful than verbosity.
 ## Companion Contract
 
 - Assemble one prompt and invoke companion `task` exactly once.
-- Do not call `status`, `result`, `cancel`, `transfer`, review commands, or setup
-  from the forwarding agent.
+- Do not call `status`, `result`, `cancel`, `logs`, `cleanup`, `export`,
+  `rerun`, `transfer`, review commands, or setup from the forwarding agent.
 - Do not poll a background job or manage its lifecycle inside this skill.
+- Pass through runtime flags the user supplied: `--timeout-ms`,
+  `--prompt-file`, `--read-only`, `--model`, `--effort`, `--session-id`,
+  `--resume-job`. Default headless timeout is one hour when timeout is omitted.
 - `--resume` maps to the companion's scoped `--resume-last`. The companion may
   resume only a confirmed, ended task from the current Claude session and
   workspace; there is no `grok sessions list` fallback.

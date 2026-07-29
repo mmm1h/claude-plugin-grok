@@ -1,6 +1,6 @@
 {
   "name": "grok",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Use the local Grok CLI from Claude Code for reviews, delegated tasks, transfers, and background jobs.",
   "author": {
     "name": "mmm1h"
