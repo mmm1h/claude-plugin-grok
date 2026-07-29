@@ -9,5 +9,5 @@ test("version metadata is synchronized", () => {
     cwd: ROOT
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /All version metadata matches 0\.4\.0/);
+  assert.match(result.stdout, /All version metadata matches 0\.4\.1/);
 });

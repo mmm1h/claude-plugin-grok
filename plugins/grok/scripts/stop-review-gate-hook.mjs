@@ -50,11 +50,19 @@ function hasWorkingTreeChanges(cwd) {
   return Boolean(String(result.stdout).trim());
 }
 
-function canSkipReview(cwd, input) {
-  if (String(input.last_assistant_message ?? "").trim()) {
-    return false;
+function canSkipReview(cwd, _input) {
+  // Gate only needs to block unresolved issues from direct edits still in the tree.
+  // Clean trees and non-git workspaces skip the paid Grok call (ALLOW by silence).
+  // A non-null dirty tree still runs the structured stop-review.
+  const changes = hasWorkingTreeChanges(cwd);
+  if (changes === false) {
+    return true;
   }
-  return hasWorkingTreeChanges(cwd) === false;
+  if (changes === null) {
+    // Not a git repo / git unavailable: cannot attribute edits; fail open without a model call.
+    return true;
+  }
+  return false;
 }
 
 function runReview(cwd, input) {

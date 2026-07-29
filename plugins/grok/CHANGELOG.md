@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 - 2026-07-29
+
+- Fixed multi-turn structured review parse failures when Grok emits concatenated
+  JSON objects (`{}{}`); the companion now keeps the last complete payload.
+- Recognized Grok CLI `thought` / `text` / `end` streaming events so reasoning
+  tokens no longer leak as "unknown" progress into Claude context.
+- Stop-review gate now short-circuits clean working trees and non-git workspaces
+  without a paid Grok call (ALLOW by silence), matching the no-edit intent.
+
 ## 0.4.0 - 2026-07-29
 
 - Added a strict `{ decision, reason }` schema for stop-time reviews and routed

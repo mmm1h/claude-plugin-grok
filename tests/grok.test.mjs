@@ -64,7 +64,42 @@ test("parseGrokStructuredOutput accepts direct payloads and common CLI envelopes
   const invalid = parseGrokStructuredOutput("not json");
   assert.equal(invalid.ok, false);
   assert.equal(invalid.raw, "not json");
-  assert.match(invalid.parseError, /JSON/);
+  assert.match(invalid.parseError, /JSON|complete JSON/i);
+});
+
+test("parseGrokStructuredOutput prefers the last object when multi-turn outputs are concatenated", () => {
+  const intermediate = {
+    verdict: "approve",
+    summary: "partial",
+    findings: [],
+    next_steps: []
+  };
+  const finalPayload = {
+    verdict: "needs-attention",
+    summary: "found bugs",
+    findings: [
+      {
+        severity: "high",
+        title: "assignment in condition",
+        body: "if (x = 1)",
+        file: "a.js",
+        line_start: 1,
+        line_end: 1,
+        confidence: 0.98,
+        recommendation: "use ==="
+      }
+    ],
+    next_steps: ["fix comparisons"]
+  };
+  const concatenated = `${JSON.stringify(intermediate)}${JSON.stringify(finalPayload)}`;
+  const parsed = parseGrokStructuredOutput(concatenated);
+  assert.equal(parsed.ok, true, parsed.parseError);
+  assert.equal(parsed.data.verdict, "needs-attention");
+  assert.equal(parsed.data.findings.length, 1);
+  assert.equal(parsed.data.findings[0].title, "assignment in condition");
+
+  const spaced = `${JSON.stringify(intermediate)}\n${JSON.stringify(finalPayload)}\n`;
+  assert.equal(parseGrokStructuredOutput(spaced).data.verdict, "needs-attention");
 });
 
 test("getGrokCapabilities detects structured output and sandbox flags", () => {
@@ -133,20 +168,65 @@ test("streaming-json telemetry confirms the session and preserves readable final
   assert.equal(result.sessionConfirmed, true);
   assert.ok(telemetry.some((event) => event.phase === "tool"));
   assert.ok(progress.some((line) => /Unparsed streaming output/.test(line)));
-  assert.ok(progress.some((line) => /Unknown streaming event/.test(line)));
+  assert.ok(progress.some((line) => /Unknown streaming event type:/.test(line)));
+  assert.ok(!progress.some((line) => line.includes("\"type\"")));
+});
+
+test("streaming thought/text/end events do not leak raw tokens into progress", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const progress = [];
+  const telemetry = [];
+  const sessionId = "77777777-7777-4777-8777-777777777777";
+  const stream = [
+    JSON.stringify({ type: "thought", text: "I am thinking token by token about secrets" }),
+    JSON.stringify({ type: "thought", text: "more reasoning" }),
+    JSON.stringify({ type: "text", text: "PING" }),
+    JSON.stringify({ type: "end" }),
+    JSON.stringify({ type: "result", result: "PING" })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "ping",
+    write: true,
+    sessionId,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_STREAM: stream
+    },
+    onTelemetry: (event) => telemetry.push(event),
+    onProgress: (line) => progress.push(line),
+    timeoutMs: 10_000
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "PING");
+  assert.ok(telemetry.some((event) => event.phase === "reasoning"));
+  assert.ok(telemetry.some((event) => event.eventType === "text"));
+  assert.ok(!progress.some((line) => /thinking token|more reasoning|secrets/i.test(line)));
+  assert.ok(!progress.some((line) => /Unknown streaming event/.test(line) && line.includes("thought")));
 });
 
 test("streaming event normalization tolerates future event shapes", () => {
-  assert.deepEqual(
-    normalizeGrokStreamingEvent({ type: "tool_start", tool: { name: "grep" }, session_id: "66666666-6666-4666-8666-666666666666" }, "2026-01-01T00:00:00.000Z"),
-    {
-      message: "Grok tool: grep",
-      phase: "tool",
-      sessionId: "66666666-6666-4666-8666-666666666666",
-      eventType: "tool_start",
-      at: "2026-01-01T00:00:00.000Z"
-    }
+  const toolEvent = normalizeGrokStreamingEvent(
+    { type: "tool_start", tool: { name: "grep" }, session_id: "66666666-6666-4666-8666-666666666666" },
+    "2026-01-01T00:00:00.000Z"
   );
+  assert.equal(toolEvent.message, "Grok tool: grep");
+  assert.equal(toolEvent.phase, "tool");
+  assert.equal(toolEvent.sessionId, "66666666-6666-4666-8666-666666666666");
+  assert.equal(toolEvent.eventType, "tool_start");
+
+  const thought = normalizeGrokStreamingEvent({ type: "thought", text: "secret chain" }, "2026-01-01T00:00:00.000Z");
+  assert.equal(thought.phase, "reasoning");
+  assert.equal(thought.suppressProgress, true);
+  assert.equal(thought.message, "");
+
+  const textEvent = normalizeGrokStreamingEvent({ type: "text", text: "hello" }, "2026-01-01T00:00:00.000Z");
+  assert.equal(textEvent.phase, "assistant");
+  assert.equal(textEvent.suppressProgress, true);
 });
 
 test("getGrokAuthStatus avoids a probe and reports local evidence", (t) => {

@@ -181,6 +181,10 @@ export function buildGrokArgs(options = {}) {
 }
 
 const STRUCTURED_OUTPUT_FIELDS = ["result", "message", "content", "output", "text"];
+// Grok multi-turn structured runs may emit one JSON object per turn, concatenated.
+// Prefer the last complete object so intermediate empty findings do not poison parse.
+const KNOWN_STREAM_EVENT_TYPES =
+  /^(system|init|session|tool|command|function|assistant|message|content|delta|result|final|complete|error|fail|thought|thinking|reasoning|text|end|usage)(_|$)|^(tool|command|function|assistant|message|content|delta|result|final|complete|error|fail|thought|thinking|reasoning|text|end|usage|system|init|session)/i;
 
 function extractStructuredObject(value, depth = 0) {
   if (depth > 8) {
@@ -210,13 +214,144 @@ function extractStructuredObject(value, depth = 0) {
   return value;
 }
 
+/**
+ * Split concatenated top-level JSON values (e.g. `{}{}` from multi-turn schema output).
+ * Returns values in order; callers should prefer the last complete object.
+ */
+export function parseConcatenatedJsonValues(raw) {
+  const text = String(raw ?? "");
+  const values = [];
+  let index = 0;
+  while (index < text.length) {
+    while (index < text.length && /\s/.test(text[index])) {
+      index += 1;
+    }
+    if (index >= text.length) {
+      break;
+    }
+    const startChar = text[index];
+    if (startChar !== "{" && startChar !== "[") {
+      const nextObject = text.indexOf("{", index);
+      const nextArray = text.indexOf("[", index);
+      const next = [nextObject, nextArray].filter((value) => value >= 0).sort((a, b) => a - b)[0];
+      if (next == null) {
+        break;
+      }
+      index = next;
+      continue;
+    }
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let end = -1;
+    for (let cursor = index; cursor < text.length; cursor += 1) {
+      const ch = text[cursor];
+      if (inString) {
+        if (escape) {
+          escape = false;
+          continue;
+        }
+        if (ch === "\\") {
+          escape = true;
+          continue;
+        }
+        if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+      if (ch === "{" || ch === "[") {
+        depth += 1;
+        continue;
+      }
+      if (ch === "}" || ch === "]") {
+        depth -= 1;
+        if (depth === 0) {
+          end = cursor;
+          break;
+        }
+      }
+    }
+    if (end < 0) {
+      break;
+    }
+    values.push(JSON.parse(text.slice(index, end + 1)));
+    index = end + 1;
+  }
+  return values;
+}
+
+function selectPreferredStructuredValue(values) {
+  if (!values.length) {
+    throw new Error("Grok structured output did not contain a complete JSON value.");
+  }
+  // Prefer the last object that already looks like review/stop-review payload.
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(value, "verdict") ||
+      Object.prototype.hasOwnProperty.call(value, "decision") ||
+      Object.prototype.hasOwnProperty.call(value, "findings") ||
+      STRUCTURED_OUTPUT_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field))
+    ) {
+      return value;
+    }
+  }
+  return values[values.length - 1];
+}
+
 export function parseGrokStructuredOutput(stdout) {
   const raw = String(stdout ?? "");
   if (!raw.trim()) {
     return { ok: false, parseError: "Grok returned no structured output.", raw };
   }
   try {
-    const data = extractStructuredObject(JSON.parse(raw));
+    let root;
+    try {
+      root = JSON.parse(raw);
+    } catch {
+      const values = parseConcatenatedJsonValues(raw);
+      root = selectPreferredStructuredValue(values);
+    }
+    // Also handle NDJSON (one object per line): take last non-empty line object.
+    if (typeof root === "object" && root != null && !Array.isArray(root)) {
+      // single object ok
+    } else if (raw.includes("\n") && raw.trim().startsWith("{")) {
+      const lineValues = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return [JSON.parse(line)];
+          } catch {
+            try {
+              return parseConcatenatedJsonValues(line);
+            } catch {
+              return [];
+            }
+          }
+        });
+      if (lineValues.length > 1) {
+        root = selectPreferredStructuredValue(lineValues);
+      }
+    }
+    // Concatenated objects that still parse as first-only is impossible with JSON.parse;
+    // when raw has }{ between values, JSON.parse fails and we already split above.
+    if (/\}\s*\{/.test(raw.trim())) {
+      const values = parseConcatenatedJsonValues(raw);
+      if (values.length > 1) {
+        root = selectPreferredStructuredValue(values);
+      }
+    }
+    const data = extractStructuredObject(root);
     return { ok: true, data, raw };
   } catch (error) {
     return {
@@ -300,18 +435,26 @@ export function normalizeGrokStreamingEvent(event, at = new Date().toISOString()
   const sessionId = streamSessionId(event);
   const toolName = event.name ?? event.tool_name ?? event.tool?.name ?? event.message?.name ?? null;
   let phase = "running";
-  if (/tool|command|function/.test(normalizedType)) {
+  // thought/text/end are emitted by Grok CLI 0.2.x streaming-json; never treat as unknown.
+  if (/thought|thinking|reasoning/.test(normalizedType)) {
+    phase = "reasoning";
+  } else if (/tool|command|function/.test(normalizedType)) {
     phase = "tool";
-  } else if (/assistant|message|content|delta/.test(normalizedType)) {
+  } else if (/assistant|message|content|delta|^text$/.test(normalizedType)) {
     phase = "assistant";
-  } else if (/result|final|complete/.test(normalizedType)) {
+  } else if (/result|final|complete|^end$/.test(normalizedType)) {
     phase = "finalizing";
   } else if (/error|fail/.test(normalizedType)) {
     phase = "failed";
+  } else if (/usage|system|init|session/.test(normalizedType)) {
+    phase = "running";
   }
 
   let message = "";
-  if (toolName) {
+  if (/thought|thinking|reasoning/.test(normalizedType)) {
+    // Suppress token-level reasoning from progress streams (would flood Claude context).
+    message = "";
+  } else if (toolName) {
     message = `Grok tool: ${toolName}`;
   } else if (typeof event.message === "string") {
     message = event.message;
@@ -319,6 +462,11 @@ export function normalizeGrokStreamingEvent(event, at = new Date().toISOString()
     message = event.error;
   } else if (sessionId) {
     message = `Grok session confirmed: ${sessionId}`;
+  } else if (/^text$/.test(normalizedType)) {
+    // Accumulate text via collector; keep progress quiet.
+    message = "";
+  } else if (/^end$|^usage$/.test(normalizedType)) {
+    message = "";
   } else {
     message = streamText(event.message ?? event.delta ?? event.content ?? event.result ?? event.output);
   }
@@ -328,7 +476,8 @@ export function normalizeGrokStreamingEvent(event, at = new Date().toISOString()
     phase,
     sessionId,
     eventType,
-    at
+    at,
+    suppressProgress: /thought|thinking|reasoning|^text$|^end$|^usage$/.test(normalizedType)
   };
 }
 
@@ -352,26 +501,33 @@ function createStreamingCollector(options = {}) {
     }
     const telemetry = normalizeGrokStreamingEvent(event);
     if (!telemetry) {
-      options.onProgress?.(`Unknown streaming event: ${raw}`);
+      // Do not forward raw event bodies — they can be huge reasoning tokens.
+      options.onProgress?.("Unparsed streaming event ignored.");
       return;
     }
     observedSessionId = telemetry.sessionId ?? observedSessionId;
     options.onTelemetry?.(telemetry, event);
 
     const type = telemetry.eventType.toLowerCase();
-    const finalText = /result|final|complete/.test(type)
-      ? streamText(event.result ?? event.output ?? event.message ?? event.content)
+    const finalText = /result|final|complete|^end$/.test(type)
+      ? streamText(event.result ?? event.output ?? event.message ?? event.content ?? event.text)
       : "";
     if (finalText.trim()) {
       finalTexts.push(finalText);
-    } else if (/assistant|message|content|delta/.test(type)) {
-      const assistantText = streamText(event.message ?? event.delta ?? event.content);
+    } else if (/assistant|message|content|delta|^text$/.test(type)) {
+      const assistantText = streamText(
+        event.message ?? event.delta ?? event.content ?? event.text ?? event
+      );
       if (assistantText) {
         assistantTexts.push(assistantText);
       }
     }
-    if (!/system|init|session|tool|command|function|assistant|message|content|delta|result|final|complete|error|fail/i.test(telemetry.eventType)) {
-      options.onProgress?.(`Unknown streaming event: ${raw}`);
+    // Never echo raw unknown JSON into progress (leaks thought tokens into Claude context).
+    // Known thought/text/end/usage events are intentionally silent in progress.
+    if (!KNOWN_STREAM_EVENT_TYPES.test(telemetry.eventType) && !telemetry.suppressProgress) {
+      options.onProgress?.(`Unknown streaming event type: ${telemetry.eventType}`);
+    } else if (telemetry.message && /tool|command|function|session/.test(type) && !telemetry.suppressProgress) {
+      options.onProgress?.(telemetry.message);
     }
   };
 

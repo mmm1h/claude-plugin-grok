@@ -50,7 +50,7 @@ process.stderr.write("fake grok progress\n");
 if (process.env.FAKE_GROK_FAIL_BEFORE_SESSION === "1") {
   process.stderr.write("fake grok failed before creating a session\n");
   process.exitCode = Number(process.env.FAKE_GROK_EXIT_CODE || 1);
-} else if (capture.outputFormat === "streaming-json") {
+} else if (capture.outputFormat === "streaming-json" && !process.env.FAKE_GROK_STREAM) {
   process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId })}\n`);
   if (process.env.FAKE_GROK_MALFORMED_EVENT === "1") {
     process.stdout.write("not-json-stream-event\n");
@@ -77,8 +77,12 @@ const defaultStructuredOutput = requestedSchema?.properties?.decision
 if (process.env.FAKE_GROK_FAIL_BEFORE_SESSION !== "1") {
   const output = process.env.FAKE_GROK_OUTPUT || "FAKE_GROK_OK";
   if (capture.outputFormat === "streaming-json") {
-    process.stdout.write(`${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: output }] }, session_id: sessionId })}\n`);
-    process.stdout.write(`${JSON.stringify({ type: "result", subtype: "success", result: output, session_id: sessionId })}\n`);
+    if (process.env.FAKE_GROK_STREAM) {
+      process.stdout.write(`${process.env.FAKE_GROK_STREAM.replace(/\n?$/, "\n")}`);
+    } else {
+      process.stdout.write(`${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: output }] }, session_id: sessionId })}\n`);
+      process.stdout.write(`${JSON.stringify({ type: "result", subtype: "success", result: output, session_id: sessionId })}\n`);
+    }
   } else {
     process.stdout.write(process.env.FAKE_GROK_OUTPUT != null
       ? `${process.env.FAKE_GROK_OUTPUT}\n`

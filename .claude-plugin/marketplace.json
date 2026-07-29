@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Grok companion plugins for Claude Code delegation and code review.",
-    "version": "0.4.0"
+    "version": "0.4.1"
   },
   "plugins": [
     {
       "name": "grok",
       "description": "Use the local Grok CLI from Claude Code for reviews, delegated tasks, transfers, and background jobs.",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "author": {
         "name": "mmm1h"
       },

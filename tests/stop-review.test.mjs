@@ -102,6 +102,61 @@ test("enabled hook short-circuits an empty message in a clean working tree", (t)
   assert.equal(fs.existsSync(capture), false);
 });
 
+test("enabled hook short-circuits status turns when the working tree is clean", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const capture = path.join(root, "capture.json");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
+  enableGate(repo, env);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const response = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "status-session",
+      last_assistant_message: "Setup looks good. No file edits were made."
+    })
+  });
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(response.stdout, "");
+  assert.equal(fs.existsSync(capture), false);
+});
+
+test("enabled hook short-circuits outside a git repository", (t) => {
+  const root = tempDir();
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
+  // Enable gate against a fake workspace path under state root by writing config via companion on a git repo first.
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  enableGate(repo, env);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const nonGit = path.join(root, "plain");
+  fs.mkdirSync(nonGit);
+  // Copy gate config into the non-git workspace state bucket by enabling there after forcing a state dir write:
+  // The hook reads config for resolveWorkspaceRoot(nonGit). Enable by writing companion state for that path.
+  enableGate(nonGit, env);
+
+  const response = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: nonGit,
+    env,
+    input: JSON.stringify({
+      cwd: nonGit,
+      session_id: "nongit-session",
+      last_assistant_message: "Just chatting."
+    })
+  });
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(response.stdout, "");
+  assert.equal(fs.existsSync(capture), false);
+});
+
 test("enabled hook emits structured blocks and fails closed on invalid output", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
