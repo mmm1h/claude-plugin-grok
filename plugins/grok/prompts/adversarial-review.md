@@ -20,16 +20,14 @@ Distinguish implementation bugs from design-level objections.
 - Do not edit files, run commands, or invent missing context.
 - Explain the concrete failure mode and affected user or operator.
 - Do not manufacture objections merely to sound adversarial.
-- If the chosen approach survives scrutiny, say so and identify the strongest residual uncertainty.
+- If the chosen approach survives scrutiny, return an empty findings array and verdict `approve`.
+- If any finding is present, use verdict `needs-attention`.
 </grounding_rules>
 
 <output_contract>
-Findings come first, ordered by severity. Use exact repository-relative paths and line references when applicable.
-Then provide:
-1. Assumptions under pressure
-2. Better alternatives, only where materially safer or simpler
-3. Open questions
-4. Ship recommendation
+Return only JSON that conforms to the supplied review output schema.
+Do not wrap the JSON in a Markdown fence and do not add prose before or after it.
+Express challenged assumptions and materially safer alternatives through findings, recommendations, summary, and next_steps.
 </output_contract>
 
 <repository_context>

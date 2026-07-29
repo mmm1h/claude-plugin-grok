@@ -80,7 +80,7 @@ Rescue tasks are write-capable by default. Ask for read-only diagnosis or planni
 
 ### `/grok:transfer`
 
-Reads the current Claude Code JSONL transcript, extracts user and assistant text turns, sends a bounded handoff prompt in one read-only Grok call, and prints a resumable session ID.
+Reads the current Claude Code JSONL transcript, extracts visible conversation context and bounded tool/compaction summaries, sends one read-only handoff prompt, and prints a resumable session ID plus a local source-hash and omission report.
 
 ```text
 /grok:transfer
@@ -89,9 +89,11 @@ Reads the current Claude Code JSONL transcript, extracts user and assistant text
 
 Transfer is intentionally **not** a native session import. Grok receives a lossy Markdown prompt:
 
-- tool calls, tool results, images, and hidden reasoning are omitted;
-- older turns and oversized turns can be truncated;
-- one Grok model call is used to create and acknowledge the handoff;
+- user/assistant text, bounded tool parameter/result summaries, visible compaction summaries, and attachment descriptions are retained where possible;
+- hidden reasoning and binary attachment bodies are excluded, while oversized turns are capped at 24,000 characters and the newest turns are selected within a 180,000-character total budget (JavaScript UTF-16 code units);
+- truncation and oldest-turn removal use explicit markers; malformed JSON and other losses appear in the local omission report;
+- one synthetic user prompt and one Grok acknowledgement create a new session;
+- native tool identity/history graphs, Claude message IDs, permissions, hooks, checkpoints, and hidden reasoning cannot be migrated;
 - continue with `grok --resume <session-id>`.
 
 ### `/grok:status`
@@ -143,14 +145,25 @@ This repository follows the user-facing shape of `openai/codex-plugin-cc`, but t
 | --- | --- | --- |
 | Local engine | Codex CLI plus app-server | Grok headless CLI |
 | Protocol | app-server JSON-RPC and broker | direct cross-platform process spawn |
-| Review | Codex app-server review | prompt-file headless call with strict read-only tools |
+| Review | Codex app-server review mode | `--json-schema` plus `--sandbox read-only`, strict shape validation, and fail-closed handling for truncated diffs |
 | Write task | Codex sandbox/config integration | `--always-approve --permission-mode bypassPermissions` |
 | Read-only task | Codex read-only sandbox | `plan` plus `read_file,grep,list_dir` allowlist |
 | Session ID | app-server thread ID | plugin-created UUID passed through `--session-id` |
-| Transfer | native external-agent import | lossy transcript-to-handoff prompt |
-| Resume-last | persistent Codex thread lookup | companion jobs, then `grok sessions list` |
+| Transfer | native external-agent import | lossy handoff envelope with source hash and omission accounting; one synthetic turn, not native import |
+| Resume | persistent Codex thread lookup | confirmed ended task sessions scoped to the current Claude session and workspace; no sessions-list fallback |
+| Telemetry | app-server notifications | task `streaming-json`; status persists phase, progress, session ID, and confirmation |
+| Cancel | app-server turn interrupt | process-tree termination; `cancelled` only after delivery or confirmed exit, and dead orphans become `failed` / `process-exited` |
 
 No Codex app-server, broker, JSON-RPC protocol, generated app-server types, `codex.mjs`, or `@openai/codex` dependency is included.
+
+### Known gaps / ceiling vs `codex-plugin-cc`
+
+- Grok has no app-server-native review mode or turn interrupt; reviews and
+  cancellation are implemented around the headless CLI process.
+- Transfer cannot import Claude's native session graph. It creates a new Grok
+  session from a bounded, lossy handoff envelope.
+- Large diffs still fail closed when companion-collected context is truncated;
+  read-only self-collection by Grok is not implemented.
 
 ## State and Privacy
 

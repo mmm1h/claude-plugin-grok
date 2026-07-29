@@ -20,7 +20,11 @@ Rules:
 - `--resume` maps to `--resume-last`; `--fresh` starts a new task session.
 - Default to write-capable work. Add `--read-only` only for explicit no-edit diagnosis, research, review, or planning.
 - Leave model and effort unset unless the user chose them.
-- Preserve task text apart from routing and runtime flags.
+- Preserve the user's task intent, paths, and acceptance criteria. Tighten the
+  task into the `grok-prompting` XML envelope before the call; do not add facts
+  or solve the request while drafting it.
+- For `--resume`, send only the follow-up delta unless constraints or direction
+  changed materially.
 - For a complex or long task with no explicit mode, prefer background execution; use foreground for a small bounded request.
 - Return companion stdout exactly as-is, with no commentary.
 - If the Bash call fails or Grok cannot be invoked, return nothing.

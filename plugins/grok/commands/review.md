@@ -13,7 +13,8 @@ Raw slash-command arguments:
 Core constraint:
 - This command is review-only.
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
-- Return Grok's output verbatim to the user.
+- Return the companion's rendered review output verbatim to the user.
+- The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call if diff context was truncated.
 
 Execution mode:
 - If the arguments include `--wait`, run in the foreground without asking.
@@ -28,7 +29,7 @@ Execution mode:
 Argument handling:
 - Preserve the user's arguments exactly.
 - `/grok:review` does not accept focus text. Use `/grok:adversarial-review` for custom focus.
-- The companion enforces a read-only Grok tool set.
+- The companion enforces both a read-only Grok sandbox and a read-only tool set.
 
 Foreground:
 ```bash

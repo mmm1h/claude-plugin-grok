@@ -67,8 +67,8 @@ function storedJob(workspaceRoot, jobId) {
   return fs.existsSync(file) ? readJobFile(file) : null;
 }
 
-function writeIndex(workspaceRoot, record) {
-  upsertJob(workspaceRoot, {
+export function indexJobRecord(record) {
+  return {
     id: record.id,
     kind: record.kind,
     title: record.title,
@@ -76,25 +76,69 @@ function writeIndex(workspaceRoot, record) {
     phase: record.phase,
     pid: record.pid ?? null,
     cwd: record.cwd,
-    workspaceRoot,
+    workspaceRoot: record.workspaceRoot,
     summary: record.summary,
     promptSummary: record.promptSummary ?? record.summary,
     sessionId: record.sessionId ?? null,
+    sessionConfirmed: Boolean(record.sessionConfirmed),
+    resumable: Boolean(record.resumable),
     claudeSessionId: record.claudeSessionId ?? null,
     resultPath: record.resultPath ?? null,
     logPath: record.logPath ?? null,
     createdAt: record.createdAt,
     startedAt: record.startedAt ?? null,
     completedAt: record.completedAt ?? null,
+    lastProgressAt: record.lastProgressAt ?? null,
+    progress: record.progress ?? null,
+    cancelRequestedAt: record.cancelRequestedAt ?? null,
+    cancelledAt: record.cancelledAt ?? null,
+    terminationMethod: record.terminationMethod ?? null,
+    terminationDelivered: record.terminationDelivered ?? null,
     errorMessage: record.errorMessage ?? null
-  });
+  };
+}
+
+function writeIndex(workspaceRoot, record) {
+  upsertJob(workspaceRoot, indexJobRecord(record));
+}
+
+export function createJobProgressUpdater({ workspaceRoot, jobId, logPath = null } = {}) {
+  return (telemetry) => {
+    if (!telemetry || typeof telemetry !== "object") {
+      return;
+    }
+    const latest = storedJob(workspaceRoot, jobId);
+    if (!latest || !["queued", "running"].includes(latest.status)) {
+      return;
+    }
+    const confirmedSessionId = telemetry.sessionId ?? null;
+    const progress = {
+      message: telemetry.message || telemetry.eventType || "Grok progress",
+      eventType: telemetry.eventType ?? "unknown",
+      at: telemetry.at ?? nowIso()
+    };
+    const patched = {
+      ...latest,
+      phase: telemetry.phase ?? latest.phase ?? "running",
+      sessionId: confirmedSessionId ?? latest.sessionId ?? null,
+      sessionConfirmed: confirmedSessionId ? true : Boolean(latest.sessionConfirmed),
+      resumable: false,
+      lastProgressAt: progress.at,
+      progress
+    };
+    writeJobFile(workspaceRoot, jobId, patched);
+    writeIndex(workspaceRoot, patched);
+    if (progress.message) {
+      appendLogLine(logPath ?? patched.logPath, progress.message);
+    }
+  };
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
   const running = {
     ...job,
     status: "running",
-    phase: "running",
+    phase: "starting",
     startedAt: job.startedAt ?? nowIso(),
     pid: process.pid,
     logPath: options.logPath ?? job.logPath ?? null,
@@ -110,14 +154,17 @@ export async function runTrackedJob(job, runner, options = {}) {
       return { ...execution, exitCode: 130, cancelled: true };
     }
     const status = execution.exitCode === 0 ? "completed" : "failed";
-    const { request: _request, ...completedBase } = running;
+    const { request: _request, ...completedBase } = latest ?? running;
+    const sessionConfirmed = Boolean(execution.sessionConfirmed || completedBase.sessionConfirmed);
     const final = {
       ...completedBase,
       status,
-      phase: status === "completed" ? "done" : "failed",
+      phase: status,
       pid: null,
       completedAt: nowIso(),
-      sessionId: execution.sessionId ?? null,
+      sessionId: execution.sessionId ?? completedBase.sessionId ?? null,
+      sessionConfirmed,
+      resumable: completedBase.kind === "task" && sessionConfirmed,
       result: execution.payload,
       rendered: execution.rendered,
       errorMessage: execution.errorMessage ?? null
@@ -132,13 +179,14 @@ export async function runTrackedJob(job, runner, options = {}) {
       return { exitCode: 130, cancelled: true, payload: null, rendered: "" };
     }
     const message = error instanceof Error ? error.message : String(error);
-    const { request: _request, ...failedBase } = running;
+    const { request: _request, ...failedBase } = latest ?? running;
     const final = {
       ...failedBase,
       status: "failed",
       phase: "failed",
       pid: null,
       completedAt: nowIso(),
+      resumable: failedBase.kind === "task" && Boolean(failedBase.sessionConfirmed),
       errorMessage: message
     };
     writeJobFile(job.workspaceRoot, job.id, final);

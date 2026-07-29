@@ -1,8 +1,13 @@
 import fs from "node:fs";
 
-import { isProcessAlive } from "./process.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { CLAUDE_SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { isProcessAlive, terminateProcessTree } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  appendLogLine,
+  CLAUDE_SESSION_ID_ENV,
+  indexJobRecord,
+  nowIso
+} from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -50,14 +55,109 @@ function progressPreview(logPath, maxLines = 4) {
 
 export function enrichJob(job, options = {}) {
   const active = job.status === "queued" || job.status === "running";
-  const orphaned = active && job.pid && !isProcessAlive(job.pid);
   return {
     ...job,
-    phase: orphaned ? "process-exited" : (job.phase ?? job.status ?? "unknown"),
+    phase: job.phase ?? job.status ?? "unknown",
     elapsed: duration(job.startedAt ?? job.createdAt, job.completedAt),
     duration: active ? null : duration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt),
     progressPreview: active || job.status === "failed" ? progressPreview(job.logPath, options.maxProgressLines) : []
   };
+}
+
+function persistJob(workspaceRoot, job) {
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, indexJobRecord(job));
+  return job;
+}
+
+export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
+  if (!["queued", "running"].includes(job.status) || !job.pid) {
+    return job;
+  }
+  const alive = options.isProcessAliveImpl ?? isProcessAlive;
+  if (alive(job.pid)) {
+    return job;
+  }
+  const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+  if (!["queued", "running"].includes(stored.status) || (stored.pid && alive(stored.pid))) {
+    return stored;
+  }
+  const message = `Tracked Grok process ${job.pid} exited before the job reached a terminal state.`;
+  const { request: _request, ...base } = stored;
+  const failed = persistJob(workspaceRoot, {
+    ...base,
+    status: "failed",
+    phase: "process-exited",
+    pid: null,
+    completedAt: nowIso(),
+    resumable: stored.kind === "task" && Boolean(stored.sessionConfirmed),
+    errorMessage: message
+  });
+  appendLogLine(failed.logPath, `Failed: ${message}`);
+  return failed;
+}
+
+function reconciledJobs(workspaceRoot, options = {}) {
+  return listJobs(workspaceRoot).map((job) => reconcileOrphanedJob(workspaceRoot, job, options));
+}
+
+export function cancelTrackedJob(workspaceRoot, job, options = {}) {
+  const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+  const cancelRequestedAt = nowIso();
+  const requested = persistJob(workspaceRoot, {
+    ...stored,
+    phase: "cancel-requested",
+    cancelRequestedAt,
+    terminationDelivered: null,
+    terminationMethod: null,
+    errorMessage: null
+  });
+  appendLogLine(requested.logPath, `Cancellation requested${options.reason ? `: ${options.reason}` : "."}`);
+
+  let termination = { attempted: false, delivered: false, method: null };
+  let terminationError = null;
+  try {
+    termination = (options.terminateImpl ?? terminateProcessTree)(requested.pid, {
+      cwd: requested.cwd,
+      env: options.env
+    });
+  } catch (error) {
+    terminationError = error instanceof Error ? error.message : String(error);
+  }
+  const alive = options.isProcessAliveImpl ?? isProcessAlive;
+  const exited = !alive(requested.pid);
+  const cancelled = Boolean(termination.delivered || exited);
+  const method = termination.method ?? (exited ? "already-exited" : null);
+
+  if (cancelled) {
+    const cancelledAt = nowIso();
+    const { request: _request, ...base } = requested;
+    const final = persistJob(workspaceRoot, {
+      ...base,
+      status: "cancelled",
+      phase: options.cancelledPhase ?? "cancelled",
+      pid: null,
+      completedAt: cancelledAt,
+      cancelledAt,
+      terminationMethod: method,
+      terminationDelivered: Boolean(termination.delivered),
+      resumable: requested.kind === "task" && Boolean(requested.sessionConfirmed),
+      errorMessage: null
+    });
+    appendLogLine(final.logPath, `Cancelled via ${method ?? "confirmed process exit"}; signal delivered: ${Boolean(termination.delivered)}.`);
+    return { job: final, previousStatus: stored.status, status: "cancelled", delivered: Boolean(termination.delivered), method, errorMessage: null };
+  }
+
+  const errorMessage = terminationError || `Could not terminate process ${requested.pid}; it is still running.`;
+  const failed = persistJob(workspaceRoot, {
+    ...requested,
+    phase: "cancel-failed",
+    terminationMethod: termination.method ?? null,
+    terminationDelivered: false,
+    errorMessage
+  });
+  appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
+  return { job: failed, previousStatus: stored.status, status: "cancel-failed", delivered: false, method: termination.method ?? null, errorMessage };
 }
 
 function matchReference(jobs, reference, predicate = () => true) {
@@ -86,7 +186,7 @@ export function readStoredJob(workspaceRoot, jobId) {
 
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(filterCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot, options), options));
   return {
     workspaceRoot,
     reviewGateEnabled: Boolean(getConfig(workspaceRoot).stopReviewGate),
@@ -96,7 +196,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const selected = matchReference(sortJobsNewestFirst(listJobs(workspaceRoot)), reference);
+  const selected = matchReference(sortJobsNewestFirst(reconciledJobs(workspaceRoot)), reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /grok:status to list known jobs.`);
   }
@@ -105,7 +205,7 @@ export function buildSingleJobSnapshot(cwd, reference) {
 
 export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(filterCurrentSession(listJobs(workspaceRoot), reference ? { all: true } : options));
+  const jobs = sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot), reference ? { all: true } : options));
   const finished = matchReference(jobs, reference, (job) => ["completed", "failed", "cancelled"].includes(job.status));
   if (finished) {
     return { workspaceRoot, job: finished };

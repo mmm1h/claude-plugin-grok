@@ -14,14 +14,13 @@ Change summary: {{CHANGE_SUMMARY}}
 - Prioritize correctness, security, data loss, concurrency, compatibility, and user-visible regressions.
 - Do not report style preferences or speculative concerns without a concrete failure mode.
 - Use exact repository-relative file paths and the narrowest useful line reference.
-- If no actionable defects are found, say so explicitly and state the main residual test risk in one sentence.
+- If no actionable defects are found, return an empty findings array and verdict `approve`.
+- If any finding is present, use verdict `needs-attention`.
 </grounding_rules>
 
 <output_contract>
-Findings come first, ordered by severity. For each finding use:
-`[severity] Title - path:line`
-Then give a concise explanation, evidence, and recommended correction.
-After findings, include `Open questions` only when necessary, followed by a brief `Summary`.
+Return only JSON that conforms to the supplied review output schema.
+Do not wrap the JSON in a Markdown fence and do not add prose before or after it.
 </output_contract>
 
 <repository_context>

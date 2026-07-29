@@ -3,11 +3,10 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
-import { listJobs, upsertJob, writeJobFile } from "./lib/state.mjs";
-import { readStoredJob } from "./lib/job-control.mjs";
+import { cancelTrackedJob } from "./lib/job-control.mjs";
+import { listJobs } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
-import { CLAUDE_SESSION_ID_ENV, nowIso } from "./lib/tracked-jobs.mjs";
+import { CLAUDE_SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 function readInput() {
@@ -41,40 +40,10 @@ function handleEnd(input) {
     (job) => job.claudeSessionId === sessionId && ["queued", "running"].includes(job.status)
   );
   for (const job of active) {
-    try {
-      terminateProcessTree(job.pid, { cwd });
-    } catch {
-      // Session teardown should continue even if a process has already exited.
-    }
-    const stored = readStoredJob(workspaceRoot, job.id) ?? job;
-    const { request: _request, ...cancelledBase } = stored;
-    const cancelled = {
-      ...cancelledBase,
-      status: "cancelled",
-      phase: "session-ended",
-      pid: null,
-      completedAt: nowIso()
-    };
-    writeJobFile(workspaceRoot, job.id, cancelled);
-    upsertJob(workspaceRoot, {
-      id: cancelled.id,
-      kind: cancelled.kind,
-      title: cancelled.title,
-      status: cancelled.status,
-      phase: cancelled.phase,
-      pid: null,
-      cwd: cancelled.cwd,
-      workspaceRoot,
-      summary: cancelled.summary,
-      promptSummary: cancelled.promptSummary,
-      write: Boolean(cancelled.write),
-      sessionId: cancelled.sessionId ?? null,
-      claudeSessionId: cancelled.claudeSessionId ?? null,
-      resultPath: cancelled.resultPath ?? null,
-      logPath: cancelled.logPath ?? null,
-      createdAt: cancelled.createdAt,
-      startedAt: cancelled.startedAt ?? null,
-      completedAt: cancelled.completedAt
+    cancelTrackedJob(workspaceRoot, job, {
+      env: process.env,
+      reason: "Claude session ended.",
+      cancelledPhase: "session-ended"
     });
   }
 }

@@ -13,7 +13,8 @@ Raw slash-command arguments:
 Core constraint:
 - This command is review-only.
 - Do not fix issues or apply patches.
-- Return Grok's output verbatim.
+- Return the companion's rendered review output verbatim.
+- The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call if diff context was truncated.
 
 Execution mode:
 - Honor explicit `--wait` or `--background` without asking.

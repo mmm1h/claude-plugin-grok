@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -8,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { normalizeArgv, parseArgs } from "./lib/args.mjs";
 import {
-  buildHandoffPrompt,
+  buildHandoffEnvelope,
   readClaudeTranscript,
   resolveClaudeSessionPath
 } from "./lib/claude-session-transfer.mjs";
@@ -18,16 +19,18 @@ import {
   findLatestTaskSession,
   getGrokAuthStatus,
   getGrokAvailability,
+  getGrokCapabilities,
+  parseGrokStructuredOutput,
   runGrokHeadless
 } from "./lib/grok.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  cancelTrackedJob,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob
 } from "./lib/job-control.mjs";
-import { terminateProcessTree } from "./lib/process.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import {
   renderCancelReport,
@@ -38,7 +41,8 @@ import {
   renderStatusReport,
   renderStoredJobResult,
   renderTaskResult,
-  renderTransferResult
+  renderTransferResult,
+  validateReviewResult
 } from "./lib/render.mjs";
 import {
   generateJobId,
@@ -52,15 +56,19 @@ import {
 import {
   appendLogLine,
   createJobLogFile,
+  createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
-  nowIso,
+  indexJobRecord,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
+const REVIEW_SCHEMA = JSON.parse(
+  fs.readFileSync(path.resolve(SCRIPT_DIR, "../schemas/review-output.schema.json"), "utf8")
+);
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240_000;
 const STATUS_POLL_INTERVAL_MS = 1_000;
@@ -122,7 +130,7 @@ function requireAvailable(cwd) {
   }
 }
 
-function makeJob({ cwd, kind, title, summary, write, request }) {
+function makeJob({ cwd, kind, title, summary, write, request, sessionId = null, sessionConfirmed = false }) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const job = createJobRecord({
     id: generateJobId(kind === "adversarial-review" ? "review" : kind),
@@ -136,33 +144,12 @@ function makeJob({ cwd, kind, title, summary, write, request }) {
     summary,
     promptSummary: summary,
     write: Boolean(write),
+    sessionId,
+    sessionConfirmed,
+    resumable: false,
     request
   });
   return job;
-}
-
-function indexRecord(record) {
-  return {
-    id: record.id,
-    kind: record.kind,
-    title: record.title,
-    status: record.status,
-    phase: record.phase,
-    pid: record.pid ?? null,
-    cwd: record.cwd,
-    workspaceRoot: record.workspaceRoot,
-    summary: record.summary,
-    promptSummary: record.promptSummary,
-    write: Boolean(record.write),
-    sessionId: record.sessionId ?? null,
-    claudeSessionId: record.claudeSessionId ?? null,
-    resultPath: record.resultPath ?? null,
-    logPath: record.logPath ?? null,
-    createdAt: record.createdAt,
-    startedAt: record.startedAt ?? null,
-    completedAt: record.completedAt ?? null,
-    errorMessage: record.errorMessage ?? null
-  };
 }
 
 function readPrompt(cwd, options, positionals) {
@@ -174,12 +161,17 @@ function readPrompt(cwd, options, positionals) {
 
 async function buildSetup(cwd, actionsTaken = []) {
   const grok = getGrokAvailability(cwd);
+  const capabilities = grok.available
+    ? getGrokCapabilities(cwd)
+    : { available: false, jsonSchema: false, sandbox: false, detail: "Grok CLI is unavailable." };
   const auth = getGrokAuthStatus(cwd);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
   const nextSteps = [];
   if (!grok.available) {
     nextSteps.push("Install the Grok CLI and ensure `grok` is on PATH.");
+  } else if (!capabilities.available) {
+    nextSteps.push("Upgrade the Grok CLI to a version that supports `--json-schema` and `--sandbox`.");
   } else if (auth.status === "needs_login") {
     nextSteps.push("Run `grok login`.");
   } else if (auth.status === "unknown") {
@@ -189,9 +181,10 @@ async function buildSetup(cwd, actionsTaken = []) {
     nextSteps.push("Optional: run `/grok:setup --enable-review-gate` to enable stop-time review.");
   }
   return {
-    ready: grok.available && auth.status !== "needs_login",
+    ready: grok.available && capabilities.available && auth.status !== "needs_login",
     node: { available: true, detail: process.version },
     grok,
+    capabilities,
     auth,
     reviewGateEnabled: Boolean(config.stopReviewGate),
     stateDir: resolveStateDir(workspaceRoot),
@@ -258,52 +251,93 @@ function buildReviewRequest(cwd, options, focus, adversarial) {
 }
 
 async function executeReview(request, onProgress) {
+  if (request.context.truncated) {
+    const parseError = "Review context was truncated; refusing to invoke Grok on an incomplete diff. Narrow the review with --base or --scope.";
+    const payload = {
+      exitCode: 1,
+      sessionId: null,
+      result: null,
+      rawOutput: "",
+      parseError,
+      stderr: "",
+      target: request.target,
+      context: request.context
+    };
+    return {
+      exitCode: 1,
+      sessionId: null,
+      payload,
+      rendered: renderReviewResult(payload),
+      errorMessage: parseError
+    };
+  }
   const result = await runGrokHeadless({
     cwd: request.cwd,
     prompt: request.prompt,
     model: request.model,
     write: false,
+    sandbox: "read-only",
+    jsonSchema: REVIEW_SCHEMA,
     onProgress
   });
+  const parsed = parseGrokStructuredOutput(result.stdout);
+  const validationError = parsed.ok ? validateReviewResult(parsed.data) : null;
+  const parseError = parsed.ok
+    ? (validationError ? `Structured review validation failed: ${validationError}` : null)
+    : parsed.parseError;
+  const exitCode = result.exitCode === 0 && parseError ? 1 : result.exitCode;
   const payload = {
-    exitCode: result.exitCode,
+    exitCode,
     sessionId: result.sessionId,
+    result: parsed.ok ? parsed.data : null,
     rawOutput: result.stdout.trimEnd(),
+    parseError,
     stderr: result.stderr.trimEnd(),
     target: request.target,
     context: request.context
   };
   return {
-    exitCode: result.exitCode,
+    exitCode,
     sessionId: result.sessionId,
     payload,
     rendered: renderReviewResult(payload),
-    errorMessage: result.exitCode === 0 ? null : (result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
+    errorMessage: exitCode === 0
+      ? null
+      : (parseError || result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
   };
 }
 
-async function executeTask(request, onProgress) {
+async function executeTask(request, onProgress, onTelemetry) {
   const result = await runGrokHeadless({
     cwd: request.cwd,
     prompt: request.prompt,
     model: request.model,
     effort: request.effort,
     write: request.write,
+    sessionId: request.sessionId,
+    sessionConfirmed: request.sessionConfirmed,
     resumeSessionId: request.resumeSessionId,
+    outputFormat: "streaming-json",
     onProgress,
+    onTelemetry,
     timeoutMs: request.timeoutMs
   });
   const payload = {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     rawOutput: result.stdout.trimEnd(),
+    rawStreamingOutput: result.rawStdout.trimEnd(),
     stderr: result.stderr.trimEnd(),
+    signal: result.signal,
+    durationMs: result.durationMs,
     write: request.write,
     resumed: Boolean(request.resumeSessionId)
   };
   return {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     payload,
     rendered: renderTaskResult(payload, { title: request.title }),
     errorMessage: result.exitCode === 0 ? null : (result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
@@ -323,9 +357,7 @@ async function executeTransfer(request, onProgress) {
     rawOutput: result.stdout.trimEnd(),
     stderr: result.stderr.trimEnd(),
     sourcePath: request.sourcePath,
-    includedTurns: request.includedTurns,
-    totalTurns: request.totalTurns,
-    omittedTurns: request.omittedTurns
+    ...request.handoffMetadata
   };
   return {
     exitCode: result.exitCode,
@@ -336,12 +368,12 @@ async function executeTransfer(request, onProgress) {
   };
 }
 
-function executeRequest(request, onProgress) {
+function executeRequest(request, onProgress, onTelemetry) {
   if (request.type === "review") {
     return executeReview(request, onProgress);
   }
   if (request.type === "task") {
-    return executeTask(request, onProgress);
+    return executeTask(request, onProgress, onTelemetry);
   }
   if (request.type === "transfer") {
     return executeTransfer(request, onProgress);
@@ -352,9 +384,10 @@ function executeRequest(request, onProgress) {
 async function runForeground(job, json) {
   const logPath = createJobLogFile(job.workspaceRoot, job.id, job.title);
   const progress = createProgressReporter({ stderr: !json, logPath });
+  const telemetry = createJobProgressUpdater({ workspaceRoot: job.workspaceRoot, jobId: job.id, logPath });
   const execution = await runTrackedJob(
     { ...job, logPath, resultPath: resolveJobFile(job.workspaceRoot, job.id) },
-    () => executeRequest(job.request, progress),
+    () => executeRequest(job.request, progress, telemetry),
     { logPath }
   );
   output(execution.payload, execution.rendered, json);
@@ -389,14 +422,14 @@ function enqueue(job) {
     resultPath: resolveJobFile(job.workspaceRoot, job.id)
   };
   writeJobFile(job.workspaceRoot, job.id, queued);
-  upsertJob(job.workspaceRoot, indexRecord(queued));
+  upsertJob(job.workspaceRoot, indexJobRecord(queued));
   appendLogLine(logPath, "Queued for background execution.");
   const child = spawnWorker(job.cwd, job.id);
   const latest = readStoredJob(job.workspaceRoot, job.id);
   if (latest?.status === "queued") {
     const withPid = { ...latest, pid: child.pid ?? null };
     writeJobFile(job.workspaceRoot, job.id, withPid);
-    upsertJob(job.workspaceRoot, indexRecord(withPid));
+    upsertJob(job.workspaceRoot, indexJobRecord(withPid));
   }
   return {
     jobId: job.id,
@@ -464,7 +497,7 @@ async function handleTask(argv) {
   }
   const resume = options["resume-last"] || options.resume ? findLatestTaskSession(cwd) : null;
   if ((options["resume-last"] || options.resume) && !resume) {
-    throw new Error("No resumable Grok task session was found for this repository.");
+    throw new Error("No resumable Grok task session was found for the current Claude session and workspace.");
   }
   const write = options["read-only"] ? false : true;
   const timeoutMs = options["timeout-ms"] == null ? null : Number(options["timeout-ms"]);
@@ -473,6 +506,7 @@ async function handleTask(argv) {
   }
   const kind = options["stop-review"] ? "stop-review" : "task";
   const title = options["stop-review"] ? "Grok Stop Review" : (resume ? "Grok Resumed Task" : "Grok Task");
+  const sessionId = resume?.sessionId ?? randomUUID();
   const request = {
     type: "task",
     cwd: resolveWorkspaceRoot(cwd),
@@ -480,6 +514,8 @@ async function handleTask(argv) {
     write,
     model: options.model ?? null,
     effort: normalizeEffort(options.effort),
+    sessionId,
+    sessionConfirmed: Boolean(resume?.sessionConfirmed),
     resumeSessionId: resume?.sessionId ?? null,
     timeoutMs,
     title
@@ -490,7 +526,9 @@ async function handleTask(argv) {
     title,
     summary: shorten(prompt),
     write,
-    request
+    request,
+    sessionId,
+    sessionConfirmed: Boolean(resume?.sessionConfirmed)
   });
   if (options.background) {
     const payload = enqueue(job);
@@ -513,7 +551,11 @@ function handleTaskResumeCandidate(argv) {
     grokAvailable: availability.available,
     sessionId: candidate?.sessionId ?? null,
     source: candidate?.source ?? null,
-    jobId: candidate?.jobId ?? null
+    jobId: candidate?.jobId ?? null,
+    status: candidate?.status ?? null,
+    summary: candidate?.summary ?? null,
+    updatedAt: candidate?.updatedAt ?? null,
+    sessionConfirmed: Boolean(candidate?.sessionConfirmed)
   };
   output(payload, payload.available
     ? `Resumable Grok session: ${payload.sessionId}\n`
@@ -530,14 +572,13 @@ async function handleTransfer(argv) {
   const sourcePath = resolveClaudeSessionPath(cwd, { source: options.source });
   const transcript = readClaudeTranscript(sourcePath);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const handoff = buildHandoffEnvelope({ cwd: workspaceRoot, sourcePath, transcript });
   const request = {
     type: "transfer",
     cwd: workspaceRoot,
     sourcePath,
-    prompt: buildHandoffPrompt({ cwd: workspaceRoot, sourcePath, transcript }),
-    includedTurns: transcript.turns.length,
-    totalTurns: transcript.totalTurns,
-    omittedTurns: transcript.omittedTurns
+    prompt: handoff.prompt,
+    handoffMetadata: handoff.metadata
   };
   const job = makeJob({
     cwd: workspaceRoot,
@@ -610,27 +651,19 @@ function handleCancel(argv) {
   });
   const cwd = commandCwd(options);
   const { workspaceRoot, job } = resolveCancelableJob(cwd, positionals[0] ?? "", { env: process.env });
-  const termination = terminateProcessTree(job.pid, { cwd });
-  const stored = readStoredJob(workspaceRoot, job.id) ?? job;
-  const completedAt = nowIso();
-  const { request: _request, ...cancelledBase } = stored;
-  const cancelled = {
-    ...cancelledBase,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt
-  };
-  writeJobFile(workspaceRoot, job.id, cancelled);
-  upsertJob(workspaceRoot, indexRecord(cancelled));
+  const cancellation = cancelTrackedJob(workspaceRoot, job, { env: process.env });
   const payload = {
     jobId: job.id,
-    previousStatus: job.status,
-    status: "cancelled",
-    delivered: termination.delivered,
-    method: termination.method
+    previousStatus: cancellation.previousStatus,
+    status: cancellation.status,
+    delivered: cancellation.delivered,
+    method: cancellation.method,
+    errorMessage: cancellation.errorMessage
   };
   output(payload, renderCancelReport(payload), options.json);
+  if (cancellation.status !== "cancelled") {
+    process.exitCode = 1;
+  }
 }
 
 async function handleWorker(argv) {
@@ -647,9 +680,10 @@ async function handleWorker(argv) {
     throw new Error(`Stored job ${options["job-id"]} has no request payload.`);
   }
   const progress = createProgressReporter({ logPath: job.logPath });
+  const telemetry = createJobProgressUpdater({ workspaceRoot, jobId: job.id, logPath: job.logPath });
   await runTrackedJob(
     { ...job, workspaceRoot },
-    () => executeRequest(job.request, progress),
+    () => executeRequest(job.request, progress, telemetry),
     { logPath: job.logPath }
   );
 }

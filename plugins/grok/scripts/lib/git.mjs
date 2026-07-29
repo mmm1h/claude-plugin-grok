@@ -42,8 +42,10 @@ function truncateUtf8(value, maxBytes) {
 function readDiff(cwd, args, maxBytes) {
   const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
   if (result.error?.code === "ENOBUFS") {
+    const partial = truncateUtf8(result.stdout, maxBytes);
     return {
-      ...truncateUtf8(result.stdout, maxBytes),
+      text: partial.text,
+      truncated: true,
       measuredBytes: maxBytes + 1
     };
   }

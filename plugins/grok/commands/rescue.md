@@ -20,6 +20,7 @@ Execution mode:
 
 Resume selection:
 - Honor explicit `--resume` or `--fresh` without asking.
+- Resume candidates are limited to confirmed, ended task sessions from the current Claude session and workspace. An active task in that scope blocks resume; without Claude session identity there is no cross-session fallback.
 - Otherwise run:
 
 ```bash
@@ -31,10 +32,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task-resume-candidate --
   - `Start a new Grok session`
 - Put `Continue current Grok session (Recommended)` first for an obvious follow-up; otherwise put `Start a new Grok session (Recommended)` first.
 - Add `--resume` or `--fresh` based on the answer.
+- `--fresh` always allocates a new Grok session UUID before launch.
 - If Grok is missing, stop and direct the user to `/grok:setup`.
 
 Operating rules:
 - The subagent is a thin forwarder. It uses exactly one Bash call to `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task ...`.
+- The subagent tightens the request with the `grok-prompting` XML contract while
+  preserving user intent. Same-session resume prompts contain only the delta.
 - Rescue/task is write-capable by default. Add `--read-only` only when the user requests diagnosis, research, planning, or no edits.
 - Return companion stdout exactly as-is.
 - Do not inspect files, poll status, fetch results, cancel jobs, summarize Grok, or do follow-up work inside the forwarding subagent.
