@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.1 - 2026-07-30
+
+### Fixes
+
+- `npm test` no longer relies on shell glob expansion of `tests/*.test.mjs`.
+  Windows CI on Node 18 failed because PowerShell passes the pattern through
+  literally; the script now uses bare `node --test` so the runner discovers
+  `*.test.mjs` on every OS and Node version in the matrix.
+- CI matrix now includes `macos-latest` (ubuntu / windows / macos × Node 18.18
+  and 22).
+
+### Documentation
+
+- README rewritten for agent readers: capability overview, install (including a
+  paste-ready agent install prompt), command table, job lifecycle and exit-code
+  conventions. Target length under 120 lines.
+
+### Features
+
+- Added user-facing skill `delegate-to-grok`: when to hand work to Grok, which
+  command to use, handoff shape (via `grok-prompting`), result handling, and
+  explicit non-use boundaries.
+
+### Chore
+
+- Removed tracked scratch `tmp/codex-out/impl-report.md` and the on-disk `tmp/`
+  residue; `.gitignore` now ignores all of `tmp/`.
+
 ## 0.5.0 - 2026-07-30
 
 ### Stability
