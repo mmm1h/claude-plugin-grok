@@ -43,11 +43,15 @@ export function initRepo(dir) {
 }
 
 export function fakeGrokEnv(stateHome, overrides = {}) {
-  return {
+  const env = {
     ...process.env,
     GROK_COMPANION_HOME: stateHome,
     GROK_COMPANION_GROK_BINARY: process.execPath,
     GROK_COMPANION_GROK_PREFIX_ARGS: JSON.stringify([FAKE_GROK]),
     ...overrides
   };
+  if (!Object.hasOwn(overrides, "GROK_COMPANION_CLAUDE_SESSION_ID")) {
+    delete env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  }
+  return env;
 }

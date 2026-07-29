@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { writeJsonFileAtomic } from "../plugins/grok/scripts/lib/fs.mjs";
 import {
   getConfig,
   listJobs,
@@ -25,6 +26,62 @@ import {
   buildStatusSnapshot
 } from "../plugins/grok/scripts/lib/job-control.mjs";
 import { tempDir } from "./helpers.mjs";
+
+test("atomic JSON writes retry transient Windows rename locks", (t) => {
+  const root = tempDir();
+  const target = path.join(root, "state.json");
+  const delays = [];
+  let attempts = 0;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  writeJsonFileAtomic(target, { ready: true }, {
+    renameSync(tempFile, filePath) {
+      attempts += 1;
+      if (attempts < 3) {
+        const error = new Error("target is temporarily locked");
+        error.code = attempts === 1 ? "EPERM" : "EBUSY";
+        throw error;
+      }
+      fs.renameSync(tempFile, filePath);
+    },
+    sleepSync(milliseconds) {
+      delays.push(milliseconds);
+    }
+  });
+
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [10, 20]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf8")), { ready: true });
+  assert.deepEqual(fs.readdirSync(root).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("atomic JSON writes rethrow after bounded retries and remove the temp file", (t) => {
+  const root = tempDir();
+  const target = path.join(root, "state.json");
+  let attempts = 0;
+  let lastError = null;
+  let thrown = null;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  try {
+    writeJsonFileAtomic(target, { ready: false }, {
+      renameSync() {
+        attempts += 1;
+        lastError = new Error(`locked ${attempts}`);
+        lastError.code = "EACCES";
+        throw lastError;
+      },
+      sleepSync() {}
+    });
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.equal(attempts, 6);
+  assert.equal(thrown, lastError);
+  assert.equal(fs.existsSync(target), false);
+  assert.deepEqual(fs.readdirSync(root), []);
+});
 
 test("state uses a user-level override and hashes workspace paths", (t) => {
   const root = tempDir();

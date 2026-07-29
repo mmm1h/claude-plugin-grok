@@ -2,6 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+const RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80, 100];
+const RETRIABLE_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const retryWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(milliseconds) {
+  Atomics.wait(retryWaiter, 0, 0, milliseconds);
+}
+
 export function ensureAbsolutePath(cwd, value) {
   return path.isAbsolute(value) ? value : path.resolve(cwd, value);
 }
@@ -24,11 +32,35 @@ export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
-export function writeJsonFileAtomic(filePath, value) {
+export function writeJsonFileAtomic(filePath, value, options = {}) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempFile = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  fs.writeFileSync(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  fs.renameSync(tempFile, filePath);
+  const renameSync = options.renameSync ?? fs.renameSync;
+  const wait = options.sleepSync ?? sleepSync;
+  let renamed = false;
+  try {
+    fs.writeFileSync(tempFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        renameSync(tempFile, filePath);
+        renamed = true;
+        return;
+      } catch (error) {
+        if (!RETRIABLE_RENAME_CODES.has(error?.code) || attempt >= RENAME_RETRY_DELAYS_MS.length) {
+          throw error;
+        }
+        wait(RENAME_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tempFile);
+      } catch {
+        // Preserve the write error if temporary-file cleanup also fails.
+      }
+    }
+  }
 }
 
 export function safeReadFile(filePath) {

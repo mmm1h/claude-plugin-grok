@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2 - 2026-07-29
+
+- Fixed structured review parsing when a Grok JSON envelope's `text` field
+  contains multiple concatenated turn payloads.
+- Collected Grok streaming `text` event `data` fragments into the final task
+  output instead of falling back to raw streaming JSON.
+- Retried atomic JSON state renames on Windows `EPERM`, `EBUSY`, and `EACCES`
+  errors so concurrent status reads cannot terminate background jobs.
+- Isolated hookless tasks from inherited Claude session state so missing session
+  scope never produces a resume candidate, including in the test environment.
+
 ## 0.4.1 - 2026-07-29
 
 - Fixed multi-turn structured review parse failures when Grok emits concatenated

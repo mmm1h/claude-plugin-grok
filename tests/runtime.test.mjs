@@ -410,7 +410,15 @@ test("failed-before-session and hookless jobs are never resume candidates", (t) 
   const failedCandidate = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: failedEnv, cwd: repo });
   assert.equal(JSON.parse(failedCandidate.stdout).available, false);
 
+  const inheritedSessionId = process.env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  process.env.GROK_COMPANION_CLAUDE_SESSION_ID = "ambient-parent-session";
   const hooklessEnv = fakeGrokEnv(state);
+  if (inheritedSessionId === undefined) {
+    delete process.env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  } else {
+    process.env.GROK_COMPANION_CLAUDE_SESSION_ID = inheritedSessionId;
+  }
+  assert.equal(Object.hasOwn(hooklessEnv, "GROK_COMPANION_CLAUDE_SESSION_ID"), false);
   const hookless = runCompanion(["task", "--fresh", "--json", "--cwd", repo, "no Claude hook"], { env: hooklessEnv, cwd: repo });
   assert.equal(hookless.status, 0, hookless.stderr);
   const hooklessCandidate = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: hooklessEnv, cwd: repo });

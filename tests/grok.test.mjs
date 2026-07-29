@@ -5,13 +5,29 @@ import test from "node:test";
 
 import {
   buildGrokArgs,
+  findLatestTaskSession,
   getGrokAuthStatus,
   getGrokCapabilities,
   normalizeGrokStreamingEvent,
   parseGrokStructuredOutput,
   runGrokHeadless
 } from "../plugins/grok/scripts/lib/grok.mjs";
+import { renderTaskResult } from "../plugins/grok/scripts/lib/render.mjs";
 import { FAKE_GROK, tempDir } from "./helpers.mjs";
+
+test("findLatestTaskSession returns no candidate without Claude session scope", () => {
+  const previous = process.env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  process.env.GROK_COMPANION_CLAUDE_SESSION_ID = "ambient-parent-session";
+  try {
+    assert.equal(findLatestTaskSession(process.cwd(), { env: {} }), null);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.GROK_COMPANION_CLAUDE_SESSION_ID;
+    } else {
+      process.env.GROK_COMPANION_CLAUDE_SESSION_ID = previous;
+    }
+  }
+});
 
 test("read-only Grok argv uses plan mode and a strict tool allowlist", () => {
   const { args, sessionId } = buildGrokArgs({
@@ -100,6 +116,13 @@ test("parseGrokStructuredOutput prefers the last object when multi-turn outputs 
 
   const spaced = `${JSON.stringify(intermediate)}\n${JSON.stringify(finalPayload)}\n`;
   assert.equal(parseGrokStructuredOutput(spaced).data.verdict, "needs-attention");
+
+  const enveloped = parseGrokStructuredOutput(JSON.stringify({
+    text: concatenated,
+    stopReason: "EndTurn"
+  }));
+  assert.equal(enveloped.ok, true, enveloped.parseError);
+  assert.deepEqual(enveloped.data, finalPayload);
 });
 
 test("getGrokCapabilities detects structured output and sandbox flags", () => {
@@ -207,6 +230,43 @@ test("streaming thought/text/end events do not leak raw tokens into progress", a
   assert.ok(telemetry.some((event) => event.eventType === "text"));
   assert.ok(!progress.some((line) => /thinking token|more reasoning|secrets/i.test(line)));
   assert.ok(!progress.some((line) => /Unknown streaming event/.test(line) && line.includes("thought")));
+});
+
+test("streaming text data fragments become final output without raw JSON fallback", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sessionId = "88888888-8888-4888-8888-888888888888";
+  const stream = [
+    JSON.stringify({ type: "thought", data: "private reasoning" }),
+    JSON.stringify({ type: "text", data: "Hello, " }),
+    JSON.stringify({ type: "text", data: "world!" }),
+    JSON.stringify({ type: "end", data: { sessionId, usage: { outputTokens: 2 } } })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "stream text fragments",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env, FAKE_GROK_STREAM: stream },
+    timeoutMs: 10_000
+  });
+
+  assert.equal(result.stdout, "Hello, world!");
+  assert.equal(result.sessionId, sessionId);
+  assert.equal(result.sessionConfirmed, true);
+  assert.match(result.rawStdout, /\"type\":\"thought\"/);
+  assert.doesNotMatch(result.stdout, /\"type\":/);
+  const rendered = renderTaskResult({
+    exitCode: result.exitCode,
+    sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
+    rawOutput: result.stdout,
+    stderr: result.stderr
+  });
+  assert.match(rendered, /Hello, world!/);
+  assert.doesNotMatch(rendered, /\"type\":/);
 });
 
 test("streaming event normalization tolerates future event shapes", () => {

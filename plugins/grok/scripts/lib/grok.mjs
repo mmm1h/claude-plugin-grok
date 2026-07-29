@@ -195,7 +195,8 @@ function extractStructuredObject(value, depth = 0) {
     if (!text) {
       throw new Error("Grok structured output envelope contains an empty value.");
     }
-    return extractStructuredObject(JSON.parse(text), depth + 1);
+    const values = parseConcatenatedJsonValues(text);
+    return extractStructuredObject(selectPreferredStructuredValue(values), depth + 1);
   }
   if (Array.isArray(value)) {
     if (value.length !== 1) {
@@ -419,6 +420,8 @@ function streamSessionId(event) {
   const values = [
     event?.sessionId,
     event?.session_id,
+    event?.data?.sessionId,
+    event?.data?.session_id,
     event?.session?.id,
     event?.message?.sessionId,
     event?.message?.session_id
@@ -516,7 +519,7 @@ function createStreamingCollector(options = {}) {
       finalTexts.push(finalText);
     } else if (/assistant|message|content|delta|^text$/.test(type)) {
       const assistantText = streamText(
-        event.message ?? event.delta ?? event.content ?? event.text ?? event
+        event.data ?? event.message ?? event.delta ?? event.content ?? event.text ?? event
       );
       if (assistantText) {
         assistantTexts.push(assistantText);
@@ -670,9 +673,9 @@ export async function runGrokHeadless(options = {}) {
 
 export function findLatestTaskSession(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const env = options.env ?? process.env;
   const claudeSessionId = options.claudeSessionId
-    ?? options.env?.GROK_COMPANION_CLAUDE_SESSION_ID
-    ?? process.env.GROK_COMPANION_CLAUDE_SESSION_ID
+    ?? env.GROK_COMPANION_CLAUDE_SESSION_ID
     ?? null;
   if (!claudeSessionId) {
     return null;
