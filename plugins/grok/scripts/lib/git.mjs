@@ -8,13 +8,22 @@ const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 const DEFAULT_SELF_COLLECT_MAX_BYTES = 512 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 32 * 1024;
+const ESTIMATED_BYTES_PER_CHANGED_LINE = 120;
+const ESTIMATED_MISSING_BINARY_BYTES = 1024 * 1024;
+
+// Force UTF-8-friendly path/log output so Windows GBK codepages do not mojibake
+// non-ASCII paths or commit text before process.mjs decodes stdout as utf8.
+const GIT_UTF8_CONFIG = [
+  "-c", "core.quotepath=false",
+  "-c", "i18n.logOutputEncoding=utf-8"
+];
 
 function git(cwd, args, options = {}) {
-  return runCommand("git", args, { cwd, ...options, shell: false });
+  return runCommand("git", [...GIT_UTF8_CONFIG, ...args], { cwd, ...options, shell: false });
 }
 
 function gitChecked(cwd, args, options = {}) {
-  return runCommandChecked("git", args, { cwd, ...options, shell: false });
+  return runCommandChecked("git", [...GIT_UTF8_CONFIG, ...args], { cwd, ...options, shell: false });
 }
 
 function lines(value) {
@@ -46,6 +55,132 @@ function truncateUtf8(value, maxBytes) {
   };
 }
 
+function splitNumstatLine(line) {
+  const first = line.indexOf("\t");
+  const second = first < 0 ? -1 : line.indexOf("\t", first + 1);
+  if (first < 0 || second < 0) {
+    return null;
+  }
+  return {
+    added: line.slice(0, first),
+    deleted: line.slice(first + 1, second),
+    filePath: line.slice(second + 1)
+  };
+}
+
+function hasGitlinkChange(cwd, rangeArgs = []) {
+  const raw = gitChecked(cwd, ["diff", "--raw", "--no-ext-diff", ...rangeArgs]).stdout;
+  for (const line of lines(raw)) {
+    const match = line.match(/^:(\d{6}) (\d{6}) /);
+    if (match && (match[1] === "160000" || match[2] === "160000")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function safeResolveRepoPath(repoRoot, relativePath) {
+  const absolutePath = path.resolve(repoRoot, relativePath);
+  const relative = path.relative(repoRoot, absolutePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+  return absolutePath;
+}
+
+function fileSizeOrZero(absolutePath) {
+  try {
+    if (!absolutePath || !fs.existsSync(absolutePath)) {
+      return 0;
+    }
+    const stat = fs.statSync(absolutePath);
+    return stat.isFile() ? stat.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Cheap size estimate for thresholding. Avoids loading full --binary/--submodule=diff
+ * output into memory (which can OOM on huge binaries or submodule expansions).
+ */
+function estimateDiffBytes(cwd, rangeArgs = []) {
+  // Submodule content expansion is unbounded with --submodule=diff.
+  if (hasGitlinkChange(cwd, rangeArgs)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  let estimated = 0;
+  const numstat = gitChecked(cwd, ["diff", "--numstat", "--no-ext-diff", ...rangeArgs]).stdout;
+  for (const line of lines(numstat)) {
+    const parsed = splitNumstatLine(line);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.added === "-" && parsed.deleted === "-") {
+      const absolutePath = safeResolveRepoPath(cwd, parsed.filePath);
+      const size = fileSizeOrZero(absolutePath);
+      // Binary diffs can approach ~2x the blob when fully replaced.
+      estimated += size > 0 ? size * 2 : ESTIMATED_MISSING_BINARY_BYTES;
+      continue;
+    }
+    const added = Number(parsed.added);
+    const deleted = Number(parsed.deleted);
+    estimated += ((Number.isFinite(added) ? added : 0) + (Number.isFinite(deleted) ? deleted : 0))
+      * ESTIMATED_BYTES_PER_CHANGED_LINE;
+  }
+
+  // Lower-bound from on-disk sizes of changed paths. Covers full-file rewrites and
+  // blobs Git may treat as a single "text" line (numstat under-reports payload size).
+  let sizeBound = 0;
+  const names = lines(gitChecked(cwd, ["diff", "--name-only", "--no-ext-diff", ...rangeArgs]).stdout);
+  for (const filePath of names) {
+    sizeBound += fileSizeOrZero(safeResolveRepoPath(cwd, filePath));
+  }
+  return Math.max(estimated, sizeBound);
+}
+
+function estimateCombinedDiffBytes(cwd, rangeArgSets) {
+  let total = 0;
+  for (const rangeArgs of rangeArgSets) {
+    total += estimateDiffBytes(cwd, rangeArgs);
+    if (total >= Number.MAX_SAFE_INTEGER / 2) {
+      return Number.MAX_SAFE_INTEGER;
+    }
+  }
+  return total;
+}
+
+/** Untracked files are not in git diff output; include their sizes for thresholding. */
+function estimateUntrackedBytes(repoRoot, untracked) {
+  let total = 0;
+  for (const relativePath of untracked) {
+    try {
+      const absolutePath = path.resolve(repoRoot, relativePath);
+      const relative = path.relative(repoRoot, absolutePath);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        continue;
+      }
+      const stat = fs.statSync(absolutePath);
+      if (stat.isFile()) {
+        total += stat.size;
+      }
+    } catch {
+      // ignore unreadable paths
+    }
+  }
+  return total;
+}
+
+function fullDiffArgs(rangeArgs = []) {
+  return ["diff", "--binary", "--no-ext-diff", "--submodule=diff", ...rangeArgs];
+}
+
+/** Safe diff args: skip binary dumps and submodule content expansion. */
+function safeDiffArgs(rangeArgs = []) {
+  return ["diff", "--no-ext-diff", "--submodule=log", ...rangeArgs];
+}
+
 function readDiff(cwd, args, maxBytes) {
   const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
   if (result.error?.code === "ENOBUFS") {
@@ -68,33 +203,15 @@ function readDiff(cwd, args, maxBytes) {
   };
 }
 
-function measureGitOutputBytes(cwd, args, maxBytes) {
-  const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
-  if (result.error?.code === "ENOBUFS") {
-    return maxBytes + 1;
+/**
+ * Read a diff for review evidence. When the change set includes binaries or
+ * gitlinks, prefer safe flags so collection itself cannot expand unbounded content.
+ */
+function readReviewDiff(cwd, rangeArgs, maxBytes) {
+  if (hasGitlinkChange(cwd, rangeArgs) || estimateDiffBytes(cwd, rangeArgs) > maxBytes) {
+    return readDiff(cwd, safeDiffArgs(rangeArgs), maxBytes);
   }
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error(formatCommandFailure(result));
-  }
-  return Buffer.byteLength(result.stdout, "utf8");
-}
-
-function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
-  let total = 0;
-  for (const args of argSets) {
-    const remaining = maxBytes - total;
-    if (remaining < 0) {
-      return maxBytes + 1;
-    }
-    total += measureGitOutputBytes(cwd, args, remaining);
-    if (total > maxBytes) {
-      return total;
-    }
-  }
-  return total;
+  return readDiff(cwd, fullDiffArgs(rangeArgs), maxBytes);
 }
 
 export function ensureGitRepository(cwd) {
@@ -216,6 +333,23 @@ function inlineCollectionGuidance() {
   return "The complete tracked diff is inline below. Use it as primary evidence and use the available read-only tools for surrounding repository context when needed.";
 }
 
+function dirtyBranchFallbackGuidance() {
+  return [
+    "The working tree is dirty, so read_file/grep/list_dir may observe uncommitted content that is not part of the selected commit range.",
+    "Primary evidence is the clean commit-range branch diff and metadata below; do not treat working-tree file reads as authoritative for this branch review."
+  ].join(" ");
+}
+
+function dirtyBranchFailureMessage() {
+  return [
+    "Branch self-collection cannot safely verify the selected commit range while the working tree is dirty and the clean commit-range diff exceeds the evidence budget.",
+    "Options:",
+    "1) Re-run with --scope working-tree to review uncommitted changes instead of the branch range.",
+    "2) Stash or commit local changes, then re-run the branch review on a clean tree so self-collection can read committed files.",
+    "3) Narrow the review (fewer commits / smaller diff) after cleaning, or pass an explicit --base on a clean tree."
+  ].join(" ");
+}
+
 function collectWorkingTreeContext(repoRoot, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const maxDiffBytes = options.maxDiffBytes;
@@ -239,17 +373,9 @@ function collectWorkingTreeContext(repoRoot, state, options = {}) {
     };
   }
 
-  const staged = readDiff(
-    repoRoot,
-    ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
-    maxDiffBytes
-  );
+  const staged = readReviewDiff(repoRoot, ["--cached"], maxDiffBytes);
   const remaining = Math.max(0, maxDiffBytes - Buffer.byteLength(staged.text, "utf8"));
-  const unstaged = readDiff(
-    repoRoot,
-    ["diff", "--binary", "--no-ext-diff", "--submodule=diff"],
-    remaining
-  );
+  const unstaged = readReviewDiff(repoRoot, [], remaining);
   const untrackedBody = state.untracked.map((file) => formatUntrackedFile(repoRoot, file)).join("\n\n");
   const truncated = staged.truncated || unstaged.truncated;
   const guidance = truncated
@@ -296,11 +422,7 @@ function collectBranchContext(repoRoot, baseRef, comparison, options = {}) {
     };
   }
 
-  const diff = readDiff(
-    repoRoot,
-    ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
-    options.maxDiffBytes
-  );
+  const diff = readReviewDiff(repoRoot, [comparison.commitRange], options.maxDiffBytes);
   const guidance = diff.truncated
     ? "The requested inline diff was truly truncated while collecting evidence. Do not approve this review."
     : inlineCollectionGuidance();
@@ -321,6 +443,49 @@ function collectBranchContext(repoRoot, baseRef, comparison, options = {}) {
   };
 }
 
+/**
+ * When branch self-collection would rely on dirty working-tree file reads, fall
+ * back to the clean commit-range diff (unaffected by uncommitted edits). If that
+ * still exceeds the evidence budget, fail with actionable recovery steps.
+ *
+ * Full temporary worktree checkout was considered but needs companion-side cwd
+ * lifecycle/cleanup outside this module; embedding the clean range diff keeps
+ * the fix local and safe.
+ */
+function applyDirtyBranchSelfCollectFallback(repoRoot, details, comparison, maxSelfCollectBytes) {
+  const guidance = dirtyBranchFallbackGuidance();
+  // Prefer safe flags: commit-range text is enough; avoid binary/submodule expansion.
+  const cleanDiff = readDiff(
+    repoRoot,
+    safeDiffArgs([comparison.commitRange]),
+    maxSelfCollectBytes
+  );
+  const content = [
+    formatSection("Collection Guidance", guidance),
+    formatSection("Commit Log", gitChecked(repoRoot, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout),
+    formatSection("Diff Stat", gitChecked(repoRoot, ["diff", "--stat", comparison.commitRange]).stdout),
+    formatSection("Changed Files", details.changedFiles.join("\n")),
+    formatSection("Branch Diff (clean commit range)", cleanDiff.text)
+  ].join("\n");
+
+  if (cleanDiff.truncated || Buffer.byteLength(content, "utf8") > maxSelfCollectBytes) {
+    const failure = dirtyBranchFailureMessage();
+    return {
+      ...details,
+      truncated: true,
+      collectionGuidance: `${failure} Do not approve this review.`,
+      content: formatSection("Collection Failure", failure)
+    };
+  }
+
+  return {
+    ...details,
+    truncated: false,
+    collectionGuidance: guidance,
+    content
+  };
+}
+
 export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
   const maxInlineFiles = normalizeLimit(options.maxInlineFiles, DEFAULT_INLINE_DIFF_MAX_FILES);
@@ -334,14 +499,9 @@ export function collectReviewContext(cwd, target, options = {}) {
   if (target.mode === "working-tree") {
     const state = getWorkingTreeState(repoRoot);
     const changedFiles = uniqueFiles(state.staged, state.unstaged, state.untracked);
-    diffBytes = measureCombinedGitOutputBytes(
-      repoRoot,
-      [
-        ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
-        ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]
-      ],
-      maxInlineDiffBytes
-    );
+    // Cheap numstat/raw estimate — never pull full --binary/--submodule=diff just to measure.
+    diffBytes = estimateCombinedDiffBytes(repoRoot, [["--cached"], []])
+      + estimateUntrackedBytes(repoRoot, state.untracked);
     includeDiff = options.includeDiff ?? (
       changedFiles.length <= maxInlineFiles && diffBytes <= maxInlineDiffBytes
     );
@@ -349,23 +509,18 @@ export function collectReviewContext(cwd, target, options = {}) {
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
     const changedFiles = lines(gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout);
-    diffBytes = measureGitOutputBytes(
-      repoRoot,
-      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
-      maxInlineDiffBytes
-    );
+    diffBytes = estimateDiffBytes(repoRoot, [comparison.commitRange]);
     includeDiff = options.includeDiff ?? (
       changedFiles.length <= maxInlineFiles && diffBytes <= maxInlineDiffBytes
     );
     details = collectBranchContext(repoRoot, target.baseRef, comparison, { includeDiff, maxDiffBytes });
     if (!includeDiff && getWorkingTreeState(repoRoot).isDirty) {
-      const failure = "Branch self-collection cannot verify the selected commit range while the working tree is dirty because read-only file tools would observe uncommitted content.";
-      details = {
-        ...details,
-        truncated: true,
-        collectionGuidance: `${failure} Do not approve this review.`,
-        content: formatSection("Collection Failure", failure)
-      };
+      details = applyDirtyBranchSelfCollectFallback(
+        repoRoot,
+        details,
+        comparison,
+        maxSelfCollectBytes
+      );
     }
   }
 

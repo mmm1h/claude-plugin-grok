@@ -238,6 +238,18 @@ export function renderTransferResult(payload) {
     .map(([kind, count]) => `${kind}=${count}`)
     .join(", ") || "none";
   const sourceHash = payload.sourceSha256 ? payload.sourceSha256.slice(0, 12) : "(unavailable)";
+  const canResume = Boolean(payload.sessionId && payload.sessionConfirmed);
+  const sessionLines = payload.sessionId
+    ? canResume
+      ? [
+          `Grok session ID: ${payload.sessionId}`,
+          `Resume in Grok: grok --resume ${payload.sessionId}`
+        ]
+      : [
+          `Grok session ID: ${payload.sessionId} (preallocated / unconfirmed)`,
+          "Resume command withheld until the Grok CLI confirms the session."
+        ]
+    : ["Grok session ID: (none)"];
   return [
     "Created a Grok handoff session from the Claude transcript.",
     "This is a lossy prompt handoff, not a native Claude-to-Grok session import.",
@@ -247,8 +259,7 @@ export function renderTransferResult(payload) {
     `Selected transcript chars: ${payload.selectedChars} of ${payload.rawChars} (UTF-16 code units).`,
     `Source SHA-256: ${sourceHash}.`,
     `Loss/omission counts: ${omissionSummary}.`,
-    `Grok session ID: ${payload.sessionId}`,
-    `Resume in Grok: grok --resume ${payload.sessionId}`,
+    ...sessionLines,
     ""
   ].join("\n");
 }

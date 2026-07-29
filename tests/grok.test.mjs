@@ -4,13 +4,19 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  assertGrokCliCompatible,
   buildGrokArgs,
+  clearGrokCapabilityCache,
+  compareGrokVersions,
   findLatestTaskSession,
   getGrokAuthStatus,
   getGrokAvailability,
   getGrokCapabilities,
+  isGrokAuthReady,
+  MIN_GROK_CLI_VERSION,
   normalizeGrokStreamingEvent,
   parseGrokStructuredOutput,
+  parseGrokVersion,
   runGrokHeadless
 } from "../plugins/grok/scripts/lib/grok.mjs";
 import { isProcessAlive } from "../plugins/grok/scripts/lib/process.mjs";
@@ -128,13 +134,16 @@ test("parseGrokStructuredOutput prefers the last object when multi-turn outputs 
 });
 
 test("getGrokCapabilities detects structured output and sandbox flags", () => {
+  clearGrokCapabilityCache();
   const capabilities = getGrokCapabilities(process.cwd(), {
     binary: process.execPath,
-    binaryPrefixArgs: [FAKE_GROK]
+    binaryPrefixArgs: [FAKE_GROK],
+    skipCache: true
   });
   assert.equal(capabilities.available, true);
   assert.equal(capabilities.jsonSchema, true);
   assert.equal(capabilities.sandbox, true);
+  assert.equal(capabilities.minVersion, MIN_GROK_CLI_VERSION);
 });
 
 test("runGrokHeadless spawns a fake binary and moves long prompts to a file", async (t) => {
@@ -151,7 +160,8 @@ test("runGrokHeadless spawns a fake binary and moves long prompts to a file", as
     binaryPrefixArgs: [FAKE_GROK],
     env: { ...process.env, FAKE_GROK_CAPTURE: capture },
     onProgress: (line) => progress.push(line),
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    skipCapabilityCheck: true
   });
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /FAKE_GROK_OK/);
@@ -184,7 +194,8 @@ test("streaming-json telemetry confirms the session and preserves readable final
     },
     onTelemetry: (event) => telemetry.push(event),
     onProgress: (line) => progress.push(line),
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    skipCapabilityCheck: true
   });
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "FAKE_GROK_OK");
@@ -224,7 +235,8 @@ test("streaming thought/text/end events do not leak raw tokens into progress", a
     },
     onTelemetry: (event) => telemetry.push(event),
     onProgress: (line) => progress.push(line),
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    skipCapabilityCheck: true
   });
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "PING");
@@ -252,7 +264,8 @@ test("streaming text data fragments become final output without raw JSON fallbac
     binary: process.execPath,
     binaryPrefixArgs: [FAKE_GROK],
     env: { ...process.env, FAKE_GROK_STREAM: stream },
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    skipCapabilityCheck: true
   });
 
   assert.equal(result.stdout, "Hello, world!");
@@ -294,10 +307,262 @@ test("streaming event normalization tolerates future event shapes", () => {
 test("getGrokAuthStatus avoids a probe and reports local evidence", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  assert.equal(getGrokAuthStatus(dir, { grokHome: dir, env: {} }).status, "needs_login");
+  const empty = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(empty.status, "needs_login");
+  assert.equal(empty.authUnverified, false);
   fs.writeFileSync(path.join(dir, "config.toml"), "[model]\n", "utf8");
-  assert.equal(getGrokAuthStatus(dir, { grokHome: dir, env: {} }).status, "unknown");
+  const configOnly = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(configOnly.status, "needs_login");
+  assert.equal(configOnly.authUnverified, true);
+  assert.equal(configOnly.source, "config.toml");
   assert.equal(getGrokAuthStatus(dir, { grokHome: dir, env: { GROK_API_KEY: "present" } }).status, "configured");
+});
+
+test("config-only auth is not ready (prevents setup false-green)", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "config.toml"), "[model]\n", "utf8");
+  const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  // Previously status was "unknown", which companion treated as ready via `!== needs_login`.
+  assert.equal(auth.status, "needs_login");
+  assert.equal(auth.authUnverified, true);
+  assert.equal(isGrokAuthReady(auth), false);
+  // Works with both the legacy companion check and the stricter helper.
+  assert.equal(auth.status !== "needs_login", false);
+  assert.equal(isGrokAuthReady({ status: "configured", authUnverified: false }), true);
+  assert.equal(isGrokAuthReady({ status: "needs_login", authUnverified: false }), false);
+  assert.equal(isGrokAuthReady({ status: "unknown", authUnverified: true }), false);
+  assert.equal(isGrokAuthReady({ status: "configured", authUnverified: true }), false);
+});
+
+test("auth ready with credential file only", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "auth.json"), '{"token":"file-secret-value-xyz"}\n', "utf8");
+  const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(auth.status, "configured");
+  assert.equal(auth.loggedIn, true);
+  assert.equal(auth.authUnverified, false);
+  assert.equal(auth.source, "auth.json");
+  assert.equal(isGrokAuthReady(auth), true);
+  assert.equal(auth.status !== "needs_login", true);
+  const serialized = JSON.stringify(auth);
+  assert.doesNotMatch(serialized, /file-secret-value-xyz/);
+});
+
+test("auth ready when config env_key env var is set", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const secret = "tpk-secret-value-must-never-leak-12345";
+  fs.writeFileSync(
+    path.join(dir, "config.toml"),
+    [
+      '[model."grok-4.5"]',
+      'model = "grok-4.5"',
+      'base_url = "http://example.invalid/v1"',
+      'env_key = "GROK_THIRD_PARTY_API_KEY"',
+      'api_backend = "chat_completions"',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { GROK_THIRD_PARTY_API_KEY: secret }
+  });
+  assert.equal(auth.status, "configured");
+  assert.equal(auth.loggedIn, true);
+  assert.equal(auth.authUnverified, false);
+  assert.equal(auth.source, "env");
+  assert.match(auth.detail, /GROK_THIRD_PARTY_API_KEY/);
+  assert.equal(isGrokAuthReady(auth), true);
+  assert.equal(auth.status !== "needs_login", true);
+  const serialized = JSON.stringify(auth);
+  assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(serialized, /tpk-secret/);
+});
+
+test("auth needs_login when config env_key env var is missing", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(dir, "config.toml"),
+    [
+      '[model."grok-4.5"]',
+      'env_key = "GROK_THIRD_PARTY_API_KEY"',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(auth.status, "needs_login");
+  assert.equal(auth.loggedIn, false);
+  assert.equal(auth.authUnverified, true);
+  assert.equal(auth.source, "config.toml");
+  assert.equal(isGrokAuthReady(auth), false);
+  assert.equal(auth.status !== "needs_login", false);
+});
+
+test("auth ready when config.toml has inline api_key (value not leaked)", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const secret = "inline-api-key-secret-do-not-leak";
+  fs.writeFileSync(path.join(dir, "config.toml"), `api_key = "${secret}"\n`, "utf8");
+  const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(auth.status, "configured");
+  assert.equal(auth.source, "config.toml");
+  assert.equal(isGrokAuthReady(auth), true);
+  const serialized = JSON.stringify(auth);
+  assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("optional auth probe can confirm or reject without defaulting on", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "agent_id"), "local-id\n", "utf8");
+
+  const withoutProbe = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(withoutProbe.status, "needs_login");
+  assert.equal(withoutProbe.authUnverified, true);
+
+  const confirmed = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: {},
+    probeAuth: true,
+    binary: "grok",
+    runCommandImpl() {
+      return { status: 0, stdout: "user@example.com\n", stderr: "", error: null };
+    }
+  });
+  assert.equal(confirmed.status, "configured");
+  assert.equal(confirmed.source, "whoami");
+  assert.equal(isGrokAuthReady(confirmed), true);
+
+  const rejected = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: {},
+    probeAuth: true,
+    binary: "grok",
+    runCommandImpl() {
+      return { status: 1, stdout: "", stderr: "not logged in", error: null };
+    }
+  });
+  assert.equal(rejected.status, "needs_login");
+  assert.equal(isGrokAuthReady(rejected), false);
+});
+
+test("parseGrokVersion and compareGrokVersions handle CLI banners", () => {
+  assert.deepEqual(parseGrokVersion("grok 0.2.114"), { raw: "0.2.114", major: 0, minor: 2, patch: 114 });
+  assert.equal(parseGrokVersion("not a version"), null);
+  assert.ok(compareGrokVersions("0.2.114", MIN_GROK_CLI_VERSION) > 0);
+  assert.ok(compareGrokVersions("0.1.9", MIN_GROK_CLI_VERSION) < 0);
+  assert.equal(compareGrokVersions("0.2.0", "0.2.0"), 0);
+});
+
+test("getGrokCapabilities records version and fails on missing required flags", () => {
+  clearGrokCapabilityCache();
+  let versionCalls = 0;
+  let helpCalls = 0;
+  const missing = getGrokCapabilities(process.cwd(), {
+    binary: "grok",
+    platform: "linux",
+    skipCache: true,
+    runCommandImpl(_command, args) {
+      const joined = args.join(" ");
+      if (joined.includes("--version")) {
+        versionCalls += 1;
+        return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+      }
+      if (joined.includes("--help")) {
+        helpCalls += 1;
+        return { status: 0, stdout: "Usage: grok\n  --output-format plain\n", stderr: "", error: null };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected", error: null };
+    }
+  });
+  assert.equal(missing.available, false);
+  assert.equal(missing.version, "0.2.114");
+  assert.equal(missing.versionOk, true);
+  assert.deepEqual(missing.missingFlags, ["--json-schema", "--sandbox"]);
+  assert.match(missing.detail, /Missing required review capabilities/);
+  assert.match(missing.detail, /Upgrade the Grok CLI/);
+  assert.equal(versionCalls, 1);
+  assert.equal(helpCalls, 1);
+
+  assert.throws(
+    () => assertGrokCliCompatible(process.cwd(), {
+      binary: "grok",
+      platform: "linux",
+      skipCache: true,
+      runCommandImpl(_command, args) {
+        if (args.join(" ").includes("--version")) {
+          return { status: 0, stdout: "grok 0.1.0\n", stderr: "", error: null };
+        }
+        return {
+          status: 0,
+          stdout: "Usage:\n  --json-schema <S>\n  --sandbox <P>\n",
+          stderr: "",
+          error: null
+        };
+      }
+    }),
+    /below the minimum supported version/
+  );
+});
+
+test("getGrokCapabilities caches probes across calls", () => {
+  clearGrokCapabilityCache();
+  let probes = 0;
+  const options = {
+    binary: "grok-cached",
+    // Pin platform so Windows where.exe is not mixed into the probe count.
+    platform: "linux",
+    runCommandImpl(_command, args) {
+      probes += 1;
+      const joined = args.join(" ");
+      if (joined.includes("--version")) {
+        return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+      }
+      return {
+        status: 0,
+        stdout: "Usage:\n  --json-schema <S>\n  --sandbox <P>\n",
+        stderr: "",
+        error: null
+      };
+    }
+  };
+  // First call: availability --version + help = 2 probes.
+  const first = getGrokCapabilities(process.cwd(), options);
+  assert.equal(first.available, true);
+  assert.equal(first.version, "0.2.114");
+  assert.equal(probes, 2);
+  // Second call: cache hit — no additional spawns.
+  const second = getGrokCapabilities(process.cwd(), options);
+  assert.equal(second.available, true);
+  assert.equal(probes, 2);
+  clearGrokCapabilityCache();
+});
+
+test("runGrokHeadless fails fast when required CLI flags are missing", async () => {
+  clearGrokCapabilityCache();
+  await assert.rejects(
+    runGrokHeadless({
+      cwd: process.cwd(),
+      prompt: "should not spawn",
+      write: false,
+      binary: "grok",
+      platform: "linux",
+      timeoutMs: 5_000,
+      skipSignalHandlers: true,
+      runCommandImpl(_command, args) {
+        if (args.join(" ").includes("--version")) {
+          return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+        }
+        return { status: 0, stdout: "Usage: grok without schema flags\n", stderr: "", error: null };
+      }
+    }),
+    /Missing required review capabilities|--json-schema/
+  );
 });
 
 test("runGrokHeadless terminates fake Grok when output exceeds the cap", async (t) => {
@@ -312,7 +577,8 @@ test("runGrokHeadless terminates fake Grok when output exceeds the cap", async (
       binaryPrefixArgs: [FAKE_GROK],
       env: { ...process.env, FAKE_GROK_OUTPUT: "x".repeat(1024) },
       maxOutputBytes: 64,
-      timeoutMs: 10_000
+      timeoutMs: 10_000,
+      skipCapabilityCheck: true
     }),
     /output exceeded 64 bytes/
   );
@@ -332,7 +598,8 @@ test("runGrokHeadless times out and reaps the fake child process", async (t) => 
       binaryPrefixArgs: [FAKE_GROK],
       env: { ...process.env, FAKE_GROK_DELAY_MS: "5000" },
       timeoutMs: 50,
-      skipSignalHandlers: true
+      skipSignalHandlers: true,
+      skipCapabilityCheck: true
     });
   } catch (error) {
     timedOut = error;
@@ -360,7 +627,8 @@ test("streaming end.data final answer is collected without raw NDJSON fallback",
     binaryPrefixArgs: [FAKE_GROK],
     env: { ...process.env, FAKE_GROK_STREAM: stream },
     timeoutMs: 10_000,
-    skipSignalHandlers: true
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
   });
   assert.equal(result.stdout, "final from end.data");
   assert.equal(result.sessionId, "99999999-9999-4999-8999-999999999999");
@@ -384,7 +652,8 @@ test("empty end keeps accumulated assistant text", async (t) => {
     binaryPrefixArgs: [FAKE_GROK],
     env: { ...process.env, FAKE_GROK_STREAM: stream },
     timeoutMs: 10_000,
-    skipSignalHandlers: true
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
   });
   assert.equal(result.stdout, "kept answer");
 });
@@ -408,7 +677,8 @@ test("unknown stream events extract safe text once and never dump raw NDJSON", a
     env: { ...process.env, FAKE_GROK_STREAM: stream },
     onProgress: (line) => progress.push(line),
     timeoutMs: 10_000,
-    skipSignalHandlers: true
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
   });
   assert.equal(result.stdout, "rescued answer more");
   assert.doesNotMatch(result.stdout, /\"type\":|brand_new_event|another_future/);
@@ -459,7 +729,8 @@ test("runGrokHeadless does not detach and registers interrupt cleanup path", asy
     binaryPrefixArgs: [FAKE_GROK],
     env: { ...process.env },
     timeoutMs: 10_000,
-    skipSignalHandlers: true
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
   });
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /FAKE_GROK_OK/);

@@ -15,13 +15,18 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 /** Leave headroom under the SessionEnd hook timeout (60s). */
 export const DEFAULT_SESSION_END_CANCEL_BUDGET_MS = 55_000;
+/** Only the trailing slice of job logs is scanned for status progress previews. */
+export const PROGRESS_PREVIEW_TAIL_BYTES = 64 * 1024;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
 function currentClaudeSession(options = {}) {
-  return options.env?.[CLAUDE_SESSION_ID_ENV] ?? process.env[CLAUDE_SESSION_ID_ENV] ?? null;
+  // When callers pass env (even empty), do not fall back to process.env — same
+  // session-isolation rule as tracked-jobs / grok.mjs (options.env ?? process.env).
+  const env = options.env ?? process.env;
+  return env[CLAUDE_SESSION_ID_ENV] ?? null;
 }
 
 function filterCurrentSession(jobs, options = {}) {
@@ -51,11 +56,39 @@ function duration(startValue, endValue = null) {
     : null;
 }
 
+function readLogTail(logPath, maxBytes = PROGRESS_PREVIEW_TAIL_BYTES) {
+  const fd = fs.openSync(logPath, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size <= 0) {
+      return "";
+    }
+    const readSize = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(readSize);
+    fs.readSync(fd, buffer, 0, readSize, size - readSize);
+    let text = buffer.toString("utf8");
+    // Drop a leading partial line when the file was larger than the tail window.
+    if (size > readSize) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline === -1 ? "" : text.slice(firstNewline + 1);
+    }
+    return text;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function progressPreview(logPath, maxLines = 4) {
   if (!logPath || !fs.existsSync(logPath)) {
     return [];
   }
-  return fs.readFileSync(logPath, "utf8")
+  let text;
+  try {
+    text = readLogTail(logPath);
+  } catch {
+    return [];
+  }
+  return text
     .split(/\r?\n/)
     .filter((line) => /^\[[^\]]+\]/.test(line))
     .map((line) => line.replace(/^\[[^\]]+\]\s*/, "").trim())

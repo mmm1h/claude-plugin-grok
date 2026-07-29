@@ -28,6 +28,7 @@ import {
   buildStatusSnapshot,
   cancelTrackedJob,
   readStoredJob,
+  reconcileSessionJobs,
   resolveCancelableJob,
   resolveResultJob
 } from "./lib/job-control.mjs";
@@ -76,6 +77,8 @@ const STOP_REVIEW_SCHEMA = JSON.parse(
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240_000;
 const STATUS_POLL_INTERVAL_MS = 1_000;
+/** Hard cap for task prompts from args, stdin, or --prompt-file (bytes, UTF-8). */
+export const MAX_PROMPT_BYTES = 16 * 1024 * 1024;
 
 function usage() {
   return [
@@ -156,11 +159,52 @@ function makeJob({ cwd, kind, title, summary, write, request, sessionId = null, 
   return job;
 }
 
+function formatByteCount(bytes) {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(bytes % (1024 * 1024) === 0 ? 0 : 1)} MiB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(bytes % 1024 === 0 ? 0 : 1)} KiB`;
+  }
+  return `${bytes} bytes`;
+}
+
+function assertPromptWithinLimit(prompt, source, maxBytes = MAX_PROMPT_BYTES) {
+  const bytes = Buffer.byteLength(prompt ?? "", "utf8");
+  if (bytes > maxBytes) {
+    throw new Error(
+      `Prompt from ${source} is ${formatByteCount(bytes)} (${bytes} bytes), `
+      + `which exceeds the maximum of ${formatByteCount(maxBytes)} (${maxBytes} bytes).`
+    );
+  }
+  return prompt;
+}
+
 function readPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    const filePath = path.resolve(cwd, options["prompt-file"]);
+    let size;
+    try {
+      size = fs.statSync(filePath).size;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Unable to read --prompt-file "${filePath}": ${detail}`);
+    }
+    if (size > MAX_PROMPT_BYTES) {
+      throw new Error(
+        `--prompt-file "${filePath}" is ${formatByteCount(size)} (${size} bytes), `
+        + `which exceeds the maximum of ${formatByteCount(MAX_PROMPT_BYTES)} (${MAX_PROMPT_BYTES} bytes).`
+      );
+    }
+    return assertPromptWithinLimit(fs.readFileSync(filePath, "utf8"), `--prompt-file ${filePath}`);
   }
-  return positionals.join(" ").trim() || readStdinIfPiped().trim();
+  const fromArgs = positionals.join(" ").trim();
+  if (fromArgs) {
+    return assertPromptWithinLimit(fromArgs, "command-line arguments");
+  }
+  const fromStdin = readStdinIfPiped();
+  assertPromptWithinLimit(fromStdin, "stdin");
+  return fromStdin.trim();
 }
 
 async function buildSetup(cwd, actionsTaken = []) {
@@ -555,6 +599,9 @@ async function handleTask(argv) {
   }
   const cwd = commandCwd(options);
   requireAvailable(cwd);
+  // Reclaim dead-PID "running" orphans before resume lookup / enqueue so they
+  // cannot permanently block findLatestTaskSession.
+  reconcileSessionJobs(resolveWorkspaceRoot(cwd));
   const prompt = readPrompt(cwd, options, positionals);
   if (!prompt) {
     throw new Error("Provide a task prompt, --prompt-file, or piped stdin.");
@@ -609,6 +656,8 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
   const cwd = commandCwd(options);
+  // Same orphan reclaim as task — candidate lookup uses findLatestTaskSession.
+  reconcileSessionJobs(resolveWorkspaceRoot(cwd));
   const availability = getGrokAvailability(cwd);
   const candidate = availability.available ? findLatestTaskSession(cwd) : null;
   const payload = {
@@ -743,6 +792,23 @@ async function handleWorker(argv) {
   const job = readStoredJob(workspaceRoot, options["job-id"]);
   if (!job?.request) {
     throw new Error(`Stored job ${options["job-id"]} has no request payload.`);
+  }
+  // Only queued jobs (or a running job already owned by this process) may execute.
+  // Reject completed/cancelled/failed/foreign-running re-entry so results are not overwritten.
+  const runnable = job.status === "queued"
+    || (job.status === "running" && job.pid === process.pid);
+  if (!runnable) {
+    const reason = `job-worker refused to run job ${job.id}: status is "${job.status}"`
+      + (job.pid != null ? ` (pid ${job.pid})` : "")
+      + "; only queued jobs (or running with this process pid) may execute.";
+    if (job.logPath) {
+      try {
+        appendLogLine(job.logPath, reason);
+      } catch {
+        // Best-effort; still fail closed below.
+      }
+    }
+    throw new Error(reason);
   }
   const progress = createProgressReporter({ logPath: job.logPath });
   const telemetry = createJobProgressUpdater({ workspaceRoot, jobId: job.id, logPath: job.logPath });

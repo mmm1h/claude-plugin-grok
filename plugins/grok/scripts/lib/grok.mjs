@@ -13,6 +13,10 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const INLINE_PROMPT_MAX_BYTES = 6 * 1024;
 const READ_ONLY_TOOLS = "read_file,grep,list_dir";
+/** Lowest Grok CLI version known to expose the flags companion hard-codes. */
+export const MIN_GROK_CLI_VERSION = "0.2.0";
+const REQUIRED_REVIEW_FLAGS = ["--json-schema", "--sandbox"];
+const capabilityCache = new Map();
 
 function grokBinary(options = {}) {
   return options.binary ?? process.env.GROK_COMPANION_GROK_BINARY ?? "grok";
@@ -34,6 +38,62 @@ function grokPrefixArgs(options = {}) {
   }
 }
 
+function capabilityCacheKey(cwd, options = {}) {
+  const binary = grokBinary(options);
+  const prefix = JSON.stringify(grokPrefixArgs(options));
+  return `${binary}\0${prefix}\0${path.resolve(cwd ?? process.cwd())}`;
+}
+
+/** Clear the in-process version/capabilities cache (tests and long-lived hosts). */
+export function clearGrokCapabilityCache() {
+  capabilityCache.clear();
+}
+
+/**
+ * Parse a Grok CLI version string (e.g. "grok 0.2.114") into comparable parts.
+ * Returns null when no semver triplet is present.
+ */
+export function parseGrokVersion(text) {
+  const match = String(text ?? "").match(/\bv?(\d+)\.(\d+)\.(\d+)\b/);
+  if (!match) {
+    return null;
+  }
+  return {
+    raw: `${match[1]}.${match[2]}.${match[3]}`,
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3])
+  };
+}
+
+/** Compare two semver strings or parsed objects. Negative if left < right. */
+export function compareGrokVersions(left, right) {
+  const a = typeof left === "string" ? parseGrokVersion(left) : left;
+  const b = typeof right === "string" ? parseGrokVersion(right) : right;
+  if (!a || !b) {
+    return null;
+  }
+  if (a.major !== b.major) {
+    return a.major - b.major;
+  }
+  if (a.minor !== b.minor) {
+    return a.minor - b.minor;
+  }
+  return a.patch - b.patch;
+}
+
+function stripAnsi(text) {
+  // CSI / OSC sequences commonly used by CLI help colorization.
+  return String(text ?? "").replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
+}
+
+function helpMentionsFlag(help, flag) {
+  const plain = stripAnsi(help);
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Allow optional ANSI remnants and accept value markers ("<", "=") or end-of-token.
+  return new RegExp(`(?:^|\\s)${escaped}(?=\\s|[=<]|$)`, "m").test(plain);
+}
+
 export function getGrokAvailability(cwd, options = {}) {
   const binary = grokBinary(options);
   const availability = binaryAvailable(binary, ["--version"], {
@@ -42,22 +102,40 @@ export function getGrokAvailability(cwd, options = {}) {
     platform: options.platform,
     runCommandImpl: options.runCommandImpl
   });
+  const version = parseGrokVersion(availability.detail);
   return {
     command: availability.command ?? binary,
-    ...availability
+    ...availability,
+    version: version?.raw ?? null
   };
 }
 
 export function getGrokCapabilities(cwd, options = {}) {
+  const key = capabilityCacheKey(cwd, options);
+  if (!options.skipCache && capabilityCache.has(key)) {
+    return capabilityCache.get(key);
+  }
+
   const binary = grokBinary(options);
-  const helpArgs = [...grokPrefixArgs(options), "--help"];
+  const run = options.runCommandImpl ?? runCommand;
+  const prefix = grokPrefixArgs(options);
+
+  // Reuse the same --version path as getGrokAvailability (no prefix fixture).
+  // A separate `prefix + --version` spawn would execute fixture scripts and side-effect
+  // (e.g. FAKE_GROK_CAPTURE) during setup, breaking short-circuit tests.
+  const availability = options.availability ?? getGrokAvailability(cwd, options);
+  const version = parseGrokVersion(availability.detail);
+  const versionOk = version
+    ? (compareGrokVersions(version, MIN_GROK_CLI_VERSION) ?? 0) >= 0
+    : null;
+
+  const helpArgs = [...prefix, "--help"];
   const invocation = resolveSpawnInvocation(binary, helpArgs, {
     cwd,
     env: options.env,
     platform: options.platform,
     runCommandImpl: options.runCommandImpl
   });
-  const run = options.runCommandImpl ?? runCommand;
   const result = run(invocation.command, invocation.args, {
     cwd,
     env: options.env,
@@ -65,27 +143,71 @@ export function getGrokCapabilities(cwd, options = {}) {
     windowsVerbatimArguments: invocation.windowsVerbatimArguments
   });
   if (result.error || result.status !== 0) {
-    return {
+    const payload = {
       available: false,
       jsonSchema: false,
       sandbox: false,
+      version: version?.raw ?? null,
+      versionOk,
+      minVersion: MIN_GROK_CLI_VERSION,
+      missingFlags: [...REQUIRED_REVIEW_FLAGS],
       detail: String(result.stderr || result.stdout || result.error?.message || `exit ${result.status}`).trim()
     };
+    if (!options.skipCache) {
+      capabilityCache.set(key, payload);
+    }
+    return payload;
   }
   const help = `${result.stdout}\n${result.stderr}`;
-  const jsonSchema = /(?:^|\s)--json-schema(?:\s|[=<]|$)/m.test(help);
-  const sandbox = /(?:^|\s)--sandbox(?:\s|[=<]|$)/m.test(help);
-  return {
-    available: jsonSchema && sandbox,
+  const jsonSchema = helpMentionsFlag(help, "--json-schema");
+  const sandbox = helpMentionsFlag(help, "--sandbox");
+  const missingFlags = [
+    !jsonSchema ? "--json-schema" : null,
+    !sandbox ? "--sandbox" : null
+  ].filter(Boolean);
+
+  let detail;
+  let available = missingFlags.length === 0 && versionOk !== false;
+  if (missingFlags.length) {
+    const versionHint = version?.raw
+      ? ` Current CLI reports ${version.raw}; companion requires >= ${MIN_GROK_CLI_VERSION} with these flags.`
+      : ` Companion requires Grok CLI >= ${MIN_GROK_CLI_VERSION} with these flags.`;
+    detail = `Missing required review capabilities: ${missingFlags.join(", ")}.${versionHint} Upgrade the Grok CLI, or pin to a compatible release if a newer build dropped these flags.`;
+  } else if (versionOk === false) {
+    detail = `Grok CLI ${version.raw} is below the minimum supported version ${MIN_GROK_CLI_VERSION}. Upgrade the Grok CLI.`;
+    available = false;
+  } else if (version?.raw) {
+    detail = `Supports structured review output and read-only sandboxing (Grok CLI ${version.raw}).`;
+  } else {
+    detail = "Supports structured review output and read-only sandboxing.";
+  }
+
+  const payload = {
+    available,
     jsonSchema,
     sandbox,
-    detail: jsonSchema && sandbox
-      ? "Supports structured review output and read-only sandboxing."
-      : `Missing required review capabilities: ${[
-          !jsonSchema ? "--json-schema" : null,
-          !sandbox ? "--sandbox" : null
-        ].filter(Boolean).join(", ")}.`
+    version: version?.raw ?? null,
+    versionOk,
+    minVersion: MIN_GROK_CLI_VERSION,
+    missingFlags,
+    detail
   };
+  if (!options.skipCache) {
+    capabilityCache.set(key, payload);
+  }
+  return payload;
+}
+
+/**
+ * Fail fast when the installed CLI lacks required flags or is too old.
+ * Uses the capability cache so repeated task/review calls do not re-spawn probes.
+ */
+export function assertGrokCliCompatible(cwd, options = {}) {
+  const capabilities = getGrokCapabilities(cwd, options);
+  if (!capabilities.available) {
+    throw new Error(capabilities.detail || "Grok CLI is missing required capabilities.");
+  }
+  return capabilities;
 }
 
 function hasNonEmptyFile(file) {
@@ -96,13 +218,88 @@ function hasNonEmptyFile(file) {
   }
 }
 
+function readTextFile(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function isNonEmptyEnvValue(value) {
+  return value != null && String(value).trim() !== "";
+}
+
+/**
+ * Collect offline auth evidence from config.toml without a TOML dependency.
+ *
+ * Supports:
+ * - model/global `env_key = "VAR"` when that env var is non-empty
+ * - inline `api_key = "..."` (presence only; value never returned)
+ *
+ * Never includes secret values in returned objects.
+ */
+function authEvidenceFromConfigToml(configPath, env) {
+  const text = readTextFile(configPath);
+  if (text == null || text.trim() === "") {
+    return null;
+  }
+
+  const envKeys = new Set();
+  for (const match of text.matchAll(/^\s*env_key\s*=\s*(?:"([^"]+)"|'([^']+)')\s*(?:#.*)?$/gm)) {
+    const key = match[1] ?? match[2];
+    if (key && key.trim()) {
+      envKeys.add(key.trim());
+    }
+  }
+  for (const key of envKeys) {
+    if (isNonEmptyEnvValue(env[key])) {
+      // Only the variable name is safe to surface — never the secret value.
+      return {
+        status: "configured",
+        loggedIn: true,
+        authUnverified: false,
+        source: "env",
+        detail: `Credentials available via environment variable ${key} (referenced by config.toml env_key).`
+      };
+    }
+  }
+
+  // Inline api_key in config counts as configured; never echo the value.
+  for (const match of text.matchAll(/^\s*api_key\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/gm)) {
+    const value = match[1] ?? match[2] ?? "";
+    if (value.trim()) {
+      return {
+        status: "configured",
+        loggedIn: true,
+        authUnverified: false,
+        source: "config.toml",
+        detail: "An API key is present in local Grok config.toml."
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Local, offline auth evidence only by default.
+ *
+ * Takeaways:
+ * - API keys / credential files / config env_key with a set env var => configured.
+ * - config.toml / agent_id alone => needs_login + authUnverified; does NOT count as ready
+ *   (see isGrokAuthReady). Avoids setup false-green on fresh installs that never logged in.
+ * - Optional probeAuth runs a lightweight `grok whoami` with timeout; default off so
+ *   setup stays fast and never issues a model/paid call.
+ */
 export function getGrokAuthStatus(_cwd, options = {}) {
   const env = options.env ?? process.env;
-  if (env.GROK_API_KEY || env.XAI_API_KEY) {
+  if (isNonEmptyEnvValue(env.GROK_API_KEY) || isNonEmptyEnvValue(env.XAI_API_KEY)) {
     return {
       status: "configured",
       loggedIn: true,
-      source: env.GROK_API_KEY ? "GROK_API_KEY" : "XAI_API_KEY",
+      authUnverified: false,
+      source: isNonEmptyEnvValue(env.GROK_API_KEY) ? "GROK_API_KEY" : "XAI_API_KEY",
       detail: "An API key environment variable is present."
     };
   }
@@ -112,35 +309,118 @@ export function getGrokAuthStatus(_cwd, options = {}) {
     "credentials.json",
     "auth.json",
     "oauth.json",
-    "tokens.json"
+    "tokens.json",
+    "api_key",
+    "api-key"
   ].map((name) => path.join(grokHome, name));
   const credential = credentialFiles.find(hasNonEmptyFile);
   if (credential) {
     return {
       status: "configured",
       loggedIn: true,
+      authUnverified: false,
       source: path.basename(credential),
       detail: "A local Grok credential file is present."
     };
   }
 
-  const configPresent = hasNonEmptyFile(path.join(grokHome, "config.toml"));
+  const configPath = path.join(grokHome, "config.toml");
+  const configPresent = hasNonEmptyFile(configPath);
+  if (configPresent) {
+    const fromConfig = authEvidenceFromConfigToml(configPath, env);
+    if (fromConfig) {
+      return fromConfig;
+    }
+  }
+
   const localIdentityPresent = hasNonEmptyFile(path.join(grokHome, "agent_id"));
   if (configPresent || localIdentityPresent) {
+    const source = configPresent ? "config.toml" : "agent_id";
+    // Optional lightweight probe — disabled by default (no network/model call on setup).
+    if (options.probeAuth) {
+      return probeGrokAuth(_cwd, options);
+    }
+    // config.toml / agent_id alone are not proof of login. Report needs_login so
+    // setup ready formulas using `status !== "needs_login"` do not false-green.
+    // authUnverified remains true so callers can tell this apart from a fully empty home.
     return {
-      status: "unknown",
-      loggedIn: null,
-      source: configPresent ? "config.toml" : "agent_id",
-      detail: "Grok is configured locally, but authentication was not tested to avoid a network or model call."
+      status: "needs_login",
+      loggedIn: false,
+      authUnverified: true,
+      source,
+      detail: "Local Grok config was found, but no credential file or API key is present. Run `grok login` before the first paid call."
     };
   }
 
   return {
     status: "needs_login",
     loggedIn: false,
+    authUnverified: false,
     source: null,
     detail: "No local Grok authentication evidence was found. Run `grok login`."
   };
+}
+
+/**
+ * Whether auth evidence is strong enough for setup "ready".
+ * needs_login / unknown / authUnverified must not count as ready.
+ * Prefer this over `status !== "needs_login"` (which treated unknown as ready).
+ */
+export function isGrokAuthReady(auth) {
+  if (!auth || typeof auth !== "object") {
+    return false;
+  }
+  if (auth.authUnverified === true) {
+    return false;
+  }
+  return auth.status === "configured";
+}
+
+function probeGrokAuth(cwd, options = {}) {
+  const binary = grokBinary(options);
+  const prefix = grokPrefixArgs(options);
+  const timeoutMs = options.probeAuthTimeoutMs ?? 3_000;
+  const run = options.runCommandImpl ?? runCommand;
+  const invocation = resolveSpawnInvocation(binary, [...prefix, "whoami"], {
+    cwd,
+    env: options.env,
+    platform: options.platform,
+    runCommandImpl: options.runCommandImpl
+  });
+  try {
+    const result = run(invocation.command, invocation.args, {
+      cwd,
+      env: options.env,
+      shell: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      timeout: timeoutMs
+    });
+    if (result.error || result.status !== 0) {
+      return {
+        status: "needs_login",
+        loggedIn: false,
+        authUnverified: false,
+        source: "whoami",
+        detail: String(result.stderr || result.stdout || result.error?.message || "grok whoami failed").trim()
+          || "grok whoami failed; run `grok login`."
+      };
+    }
+    return {
+      status: "configured",
+      loggedIn: true,
+      authUnverified: false,
+      source: "whoami",
+      detail: "Confirmed via `grok whoami`."
+    };
+  } catch (error) {
+    return {
+      status: "unknown",
+      loggedIn: null,
+      authUnverified: true,
+      source: "whoami",
+      detail: `Auth probe failed: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
 }
 
 export function buildGrokArgs(options = {}) {
@@ -634,6 +914,11 @@ function createStreamingCollector(options = {}) {
 export async function runGrokHeadless(options = {}) {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const childEnv = options.env ?? process.env;
+  // Fail fast on missing flags / too-old CLI before spending a model call.
+  // Cached; skip with options.skipCapabilityCheck for tests that only exercise spawn plumbing.
+  if (!options.skipCapabilityCheck) {
+    assertGrokCliCompatible(cwd, options);
+  }
   let tempDir = null;
   let promptFile = options.promptFile ? path.resolve(cwd, options.promptFile) : null;
   if (!promptFile && Buffer.byteLength(String(options.prompt ?? ""), "utf8") > INLINE_PROMPT_MAX_BYTES) {

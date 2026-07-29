@@ -148,13 +148,50 @@ test("transfer renderer shows the local fidelity bill and shortened source hash"
     rawChars: 500,
     sourceSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     omissions: { bad_json: 1, omitted_oldest: 2 },
-    sessionId: "44444444-4444-4444-8444-444444444444"
+    sessionId: "44444444-4444-4444-8444-444444444444",
+    sessionConfirmed: true
   });
   assert.match(rendered, /lossy prompt handoff/);
   assert.match(rendered, /Included transcript turns: 3 of 5/);
   assert.match(rendered, /Source SHA-256: 0123456789ab/);
   assert.match(rendered, /bad_json=1/);
   assert.match(rendered, /omitted_oldest=2/);
+  assert.match(rendered, /grok --resume 44444444/);
+});
+
+test("transfer renderer withholds resume when session is unconfirmed", () => {
+  const unconfirmed = renderTransferResult({
+    includedTurns: 1,
+    totalTurns: 1,
+    omittedTurns: 0,
+    selectedEventCount: 1,
+    rawEventCount: 1,
+    selectedChars: 10,
+    rawChars: 10,
+    sourceSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    omissions: {},
+    sessionId: "55555555-5555-4555-8555-555555555555",
+    sessionConfirmed: false
+  });
+  assert.match(unconfirmed, /preallocated \/ unconfirmed/);
+  assert.match(unconfirmed, /Resume command withheld/);
+  assert.doesNotMatch(unconfirmed, /grok --resume/);
+
+  const confirmed = renderTransferResult({
+    includedTurns: 1,
+    totalTurns: 1,
+    omittedTurns: 0,
+    selectedEventCount: 1,
+    rawEventCount: 1,
+    selectedChars: 10,
+    rawChars: 10,
+    sourceSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    omissions: {},
+    sessionId: "55555555-5555-4555-8555-555555555555",
+    sessionConfirmed: true
+  });
+  assert.match(confirmed, /grok --resume 55555555/);
+  assert.doesNotMatch(confirmed, /preallocated/);
 });
 
 test("review renderer validates, sorts, and renders structured findings", () => {

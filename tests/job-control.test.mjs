@@ -4,8 +4,11 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  buildStatusSnapshot,
   cancelTrackedJobsParallel,
+  enrichJob,
   markJobCancelRequested,
+  PROGRESS_PREVIEW_TAIL_BYTES,
   reconcileOrphanedJob,
   reconcileSessionJobs,
   resolveCancelableJob,
@@ -13,6 +16,7 @@ import {
 } from "../plugins/grok/scripts/lib/job-control.mjs";
 import { listJobs, readJobFile, resolveJobFile, saveState, writeJobFile } from "../plugins/grok/scripts/lib/state.mjs";
 import { CLAUDE_SESSION_ID_ENV } from "../plugins/grok/scripts/lib/tracked-jobs.mjs";
+import { resolveWorkspaceRoot } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { initRepo, PLUGIN_ROOT, tempDir } from "./helpers.mjs";
 
 function withStateHome(t) {
@@ -317,4 +321,75 @@ test("reconcileOrphanedJob is a no-op when the process is still alive", (t) => {
 test("SessionEnd hook timeout is raised to 60 seconds for multi-job cancel", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8"));
   assert.equal(hooks.hooks.SessionEnd[0].hooks[0].timeout, 60);
+});
+
+test("currentClaudeSession does not fall back to process.env when options.env is provided", (t) => {
+  const { repo } = withStateHome(t);
+  const previous = process.env[CLAUDE_SESSION_ID_ENV];
+  process.env[CLAUDE_SESSION_ID_ENV] = "sess-ambient";
+  t.after(() => {
+    if (previous === undefined) {
+      delete process.env[CLAUDE_SESSION_ID_ENV];
+    } else {
+      process.env[CLAUDE_SESSION_ID_ENV] = previous;
+    }
+  });
+  seedJobs(repo, [
+    {
+      id: "task-other-session",
+      kind: "task",
+      status: "completed",
+      phase: "completed",
+      claudeSessionId: "sess-other",
+      updatedAt: "2026-07-29T10:00:00.000Z"
+    }
+  ]);
+  // options.env is present but lacks the session key — must not inherit ambient process.env.
+  const snapshot = buildStatusSnapshot(repo, { env: { GROK_COMPANION_HOME: process.env.GROK_COMPANION_HOME } });
+  assert.equal(snapshot.jobs.length, 1);
+  assert.equal(snapshot.jobs[0].id, "task-other-session");
+});
+
+test("progressPreview reads only the log tail for large files", (t) => {
+  const root = tempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const logPath = path.join(root, "huge.log");
+  // Early timestamped line, then a payload larger than the tail window, then recent lines.
+  const body = [
+    "[2026-01-01T00:00:00.000Z] buried progress that may fall outside the tail window",
+    "x".repeat(PROGRESS_PREVIEW_TAIL_BYTES + 8_192),
+    "[2026-01-01T00:00:01.000Z] recent step one",
+    "[2026-01-01T00:00:02.000Z] recent step two",
+    "[2026-01-01T00:00:03.000Z] recent step three",
+    "[2026-01-01T00:00:04.000Z] recent step four",
+    "[2026-01-01T00:00:05.000Z] latest progress"
+  ].join("\n");
+  fs.writeFileSync(logPath, body, "utf8");
+  assert.ok(fs.statSync(logPath).size > PROGRESS_PREVIEW_TAIL_BYTES);
+
+  const enriched = enrichJob({
+    id: "task-preview",
+    status: "running",
+    phase: "tool",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    logPath
+  });
+  assert.ok(enriched.progressPreview.includes("latest progress"));
+  assert.ok(enriched.progressPreview.includes("recent step four"));
+  assert.equal(enriched.progressPreview.length <= 4, true);
+  assert.equal(enriched.progressPreview.includes("buried progress that may fall outside the tail window"), false);
+});
+
+test("non-git workspace roots canonicalize to a shared absolute path", (t) => {
+  const root = tempDir();
+  const workspace = path.join(root, "workspace");
+  fs.mkdirSync(workspace, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const viaResolved = resolveWorkspaceRoot(workspace);
+  const viaRelative = resolveWorkspaceRoot(path.join(workspace, ".", "sub", ".."));
+  assert.equal(viaResolved, viaRelative);
+  // realpath should produce a stable absolute path (Windows casing/junctions included).
+  assert.equal(path.isAbsolute(viaResolved), true);
+  assert.equal(fs.existsSync(viaResolved), true);
 });

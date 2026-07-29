@@ -513,3 +513,155 @@ test("transfer CLI creates a read-only resumable handoff with fake Grok", (t) =>
   assert.equal(captured.prompt.includes(transcript), false);
   assert.ok(captured.args.includes("read_file,grep,list_dir"));
 });
+
+test("task and task-resume-candidate reclaim dead-PID orphans before findLatestTaskSession", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(state, {
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-orphan-reclaim",
+    FAKE_GROK_DELAY_MS: "10000"
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(["task", "--background", "--json", "--cwd", repo, "orphan then resume"], {
+    env,
+    cwd: repo
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const running = await waitForJob(repo, env, jobId, (job) => job.status === "running" && job.pid);
+  const termination = terminateProcessTree(running.pid, { cwd: repo, env });
+  assert.equal(termination.delivered, true);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // Without status/result the index would still say running; resume paths must reconcile first
+  // so they do not permanently throw "Cannot resume while ... is running".
+  const candidate = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(candidate.status, 0, candidate.stderr);
+  assert.doesNotMatch(candidate.stderr, /Cannot resume while Grok task/);
+  const candidatePayload = JSON.parse(candidate.stdout);
+  // Reconcile flips the orphan to failed. Whether it is resumable depends on whether
+  // sessionConfirmed landed before the kill (race with FAKE_GROK_DELAY_MS).
+  if (candidatePayload.available) {
+    assert.equal(candidatePayload.jobId, jobId);
+    assert.equal(candidatePayload.status, "failed");
+  }
+
+  const status = runCompanion(["status", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+  const failedJob = JSON.parse(status.stdout).job;
+  assert.equal(failedJob.status, "failed");
+  assert.equal(failedJob.phase, "process-exited");
+
+  // task --resume must reconcile too (not block on the stale running index entry).
+  const resumeCapture = path.join(root, "resume-after-orphan.json");
+  const resume = runCompanion(["task", "--resume", "--json", "--cwd", repo, "after orphan reclaim"], {
+    env: { ...env, FAKE_GROK_CAPTURE: resumeCapture, FAKE_GROK_DELAY_MS: "0" },
+    cwd: repo
+  });
+  assert.doesNotMatch(resume.stderr, /Cannot resume while Grok task/);
+  if (candidatePayload.available) {
+    assert.equal(resume.status, 0, resume.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(resumeCapture, "utf8")).resumeSessionId, failedJob.sessionId);
+  } else {
+    assert.equal(resume.status, 1, resume.stderr);
+    assert.match(resume.stderr, /No resumable Grok task session/);
+  }
+});
+
+test("job-worker refuses to re-run completed or cancelled jobs", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(state, { FAKE_GROK_CAPTURE: capture });
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const id = "task-already-done";
+  const logPath = path.join(repo, `${id}.log`);
+  fs.writeFileSync(logPath, "", "utf8");
+  const originalResult = { rawOutput: "ORIGINAL_RESULT", exitCode: 0 };
+  const job = {
+    id,
+    kind: "task",
+    title: "Grok Task",
+    status: "completed",
+    phase: "completed",
+    pid: null,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "already finished",
+    write: true,
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    logPath,
+    resultPath: resolveJobFile(repo, id),
+    result: originalResult,
+    request: {
+      type: "task",
+      cwd: repo,
+      prompt: "must not run again",
+      write: true,
+      model: null,
+      effort: null,
+      sessionId: null,
+      sessionConfirmed: false,
+      resumeSessionId: null,
+      timeoutMs: null,
+      title: "Grok Task"
+    }
+  };
+  writeJobFile(repo, id, job);
+  upsertJob(repo, indexJobRecord(job));
+
+  const worker = runCompanion(["job-worker", "--cwd", repo, "--job-id", id], { env, cwd: repo });
+  assert.notEqual(worker.status, 0);
+  assert.match(worker.stderr, /refused to run job|status is "completed"/i);
+  assert.equal(fs.existsSync(capture), false);
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, id), "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.deepEqual(stored.result, originalResult);
+});
+
+test("task rejects oversized --prompt-file before invoking Grok", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const promptFile = path.join(root, "huge-prompt.txt");
+  const maxPromptBytes = 16 * 1024 * 1024;
+  // One byte over the companion limit; write without holding the full string in V8 heap longer than needed.
+  const fd = fs.openSync(promptFile, "w");
+  try {
+    fs.writeSync(fd, Buffer.alloc(maxPromptBytes, 0x61));
+    fs.writeSync(fd, Buffer.from("!"));
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(fs.statSync(promptFile).size, maxPromptBytes + 1);
+
+  const response = runCompanion(
+    ["task", "--json", "--cwd", repo, "--prompt-file", promptFile],
+    { env, cwd: repo, timeout: 30_000 }
+  );
+  assert.equal(response.status, 1);
+  assert.match(response.stderr, /prompt-file/i);
+  assert.match(response.stderr, /exceeds the maximum/i);
+  assert.match(response.stderr, /16/);
+  assert.equal(fs.existsSync(capture), false);
+});
