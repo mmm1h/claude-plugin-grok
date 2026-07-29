@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  renderCancelReport,
+  renderCleanupReport,
+  renderExportReport,
   renderJobStatusReport,
+  renderLogsReport,
+  renderRerunReport,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
@@ -253,4 +258,42 @@ test("review renderer reports parse and shape failures with raw output", () => {
   });
   assert.match(invalidShape, /missing required field/);
   assert.doesNotMatch(invalidShape, /No material findings/);
+});
+
+test("logs cleanup export rerun and bulk cancel renderers produce readable reports", () => {
+  assert.match(renderLogsReport({
+    jobId: "task-1",
+    logPath: "C:\\state\\task-1.log",
+    exists: true,
+    lines: ["[t] starting", "[t] done"],
+    totalLines: 2,
+    tail: 80
+  }), /task-1/);
+  assert.match(renderCleanupReport({
+    dryRun: true,
+    removedCount: 1,
+    workspaceRoot: "C:\\repo",
+    removed: [{ id: "task-1", kind: "task", status: "completed", updatedAt: "2026-07-29T00:00:00.000Z" }]
+  }), /Dry run/);
+  assert.match(renderExportReport({
+    jobId: "task-1",
+    outPath: "C:\\repo\\task-1.export.json",
+    hasLog: true,
+    hasRerun: true
+  }), /Includes rerun payload: yes/);
+  assert.match(renderRerunReport({
+    sourceJobId: "task-1",
+    jobId: "task-2",
+    status: "queued",
+    summary: "again",
+    logPath: "C:\\state\\task-2.log"
+  }), /Reran job task-1 as task-2/);
+  assert.match(renderCancelReport({
+    requestedCount: 2,
+    cancelledCount: 2,
+    results: [
+      { jobId: "a", status: "cancelled", method: "taskkill" },
+      { jobId: "b", status: "cancelled", method: "taskkill" }
+    ]
+  }), /Cancelled 2 of 2/);
 });

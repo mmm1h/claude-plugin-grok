@@ -17,6 +17,9 @@ const DEFAULT_STALE_LOCK_MS = 30_000;
 const TERMINAL_JOB_STATUSES = new Set(["cancelled", "completed", "failed"]);
 const lockWaiter = new Int32Array(new SharedArrayBuffer(4));
 
+/** Index retention cap — exported for cleanup / help text. */
+export const JOB_INDEX_LIMIT = MAX_JOBS;
+
 let lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS;
 let staleLockMs = DEFAULT_STALE_LOCK_MS;
 let sleepSyncImpl = sleepSyncDefault;
@@ -382,13 +385,16 @@ function saveStateUnlocked(cwd, state) {
   };
   writeJsonFileAtomic(file, value);
   const retained = new Set(value.jobs.map((job) => job.id));
+  const prunedIds = [];
   for (const job of previousJobs) {
     if (retained.has(job.id)) {
       continue;
     }
+    prunedIds.push(job.id);
     for (const target of [
       path.join(resolveJobsDir(cwd), `${job.id}.json`),
-      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`)
+      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`),
+      path.join(resolveJobsDir(cwd), `${job.id}.rerun.json`)
     ]) {
       try {
         if (fs.existsSync(target)) {
@@ -398,6 +404,15 @@ function saveStateUnlocked(cwd, state) {
         // Pruning the index must not make an otherwise valid state update fail.
       }
     }
+  }
+  if (prunedIds.length > 0) {
+    const sample = prunedIds.slice(0, 3).join(", ");
+    const more = prunedIds.length > 3 ? ` (+${prunedIds.length - 3} more)` : "";
+    process.stderr.write(
+      `[grok] Pruned ${prunedIds.length} old job(s) from the index (limit ${MAX_JOBS}): `
+      + `${sample}${more}. Export with /grok:export before retention drops them, `
+      + `or manage history with /grok:cleanup.\n`
+    );
   }
   return value;
 }
@@ -452,6 +467,41 @@ export function resolveJobFile(cwd, jobId) {
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
+}
+
+/**
+ * Sidecar path for rerun payloads. Terminal job records drop `request`
+ * (tracked-jobs strips it); this file keeps a minimal copy for `/grok:rerun`.
+ */
+export function resolveJobRerunFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.rerun.json`);
+}
+
+export function writeJobRerunPayload(cwd, jobId, payload) {
+  ensureStateDir(cwd);
+  const file = resolveJobRerunFile(cwd, jobId);
+  writeJsonFileAtomic(file, {
+    version: 1,
+    jobId,
+    savedAt: nowIso(),
+    ...payload
+  });
+  return file;
+}
+
+export function readJobRerunPayload(cwd, jobId) {
+  const file = resolveJobRerunFile(cwd, jobId);
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[grok] Failed to parse rerun payload ${file}: ${message}\n`);
+    return null;
+  }
 }
 
 /**

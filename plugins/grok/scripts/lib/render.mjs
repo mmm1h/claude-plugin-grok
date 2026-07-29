@@ -398,6 +398,21 @@ export function renderStoredJobResult(storedJob) {
 }
 
 export function renderCancelReport(payload) {
+  if (payload.results) {
+    const lines = [
+      `Cancelled ${payload.cancelledCount ?? 0} of ${payload.requestedCount ?? payload.results.length} Grok job(s).`,
+      ""
+    ];
+    for (const entry of payload.results) {
+      lines.push(
+        `- ${entry.jobId}: ${entry.status}`
+        + (entry.method ? ` via ${entry.method}` : "")
+        + (entry.errorMessage ? ` (${entry.errorMessage})` : "")
+      );
+    }
+    lines.push("");
+    return lines.join("\n");
+  }
   if (payload.status !== "cancelled") {
     return [
       `Could not cancel Grok job ${payload.jobId}.`,
@@ -413,4 +428,60 @@ export function renderCancelReport(payload) {
     `Process termination delivered: ${yesNo(payload.delivered)}.`,
     ""
   ].join("\n");
+}
+
+export function renderLogsReport(payload) {
+  const lines = [
+    `Job ID: ${payload.jobId}`,
+    `Log: ${payload.logPath ?? "(none)"}`,
+    `Lines shown: ${payload.lines?.length ?? 0} of ${payload.totalLines ?? 0} (tail ${payload.tail})`,
+    ""
+  ];
+  if (!payload.exists) {
+    lines.push("Log file not found.");
+  } else if (!payload.lines?.length) {
+    lines.push("(empty log)");
+  } else {
+    lines.push(...payload.lines);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+export function renderCleanupReport(payload) {
+  const mode = payload.dryRun ? "Dry run" : "Cleanup";
+  const lines = [
+    `${mode}: ${payload.removedCount} job(s) selected.`,
+    `Workspace: ${payload.workspaceRoot}`,
+    ""
+  ];
+  if (!payload.removed?.length) {
+    lines.push("No jobs matched the cleanup criteria.");
+  } else {
+    for (const entry of payload.removed) {
+      lines.push(`- ${entry.id} (${entry.kind}, ${entry.status}) updated ${entry.updatedAt ?? "unknown"}`);
+    }
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+export function renderExportReport(payload) {
+  return [
+    `Exported job ${payload.jobId}.`,
+    `Output: ${payload.outPath}`,
+    `Includes log: ${yesNo(payload.hasLog)}.`,
+    `Includes rerun payload: ${yesNo(payload.hasRerun)}.`,
+    ""
+  ].join("\n");
+}
+
+export function renderRerunReport(payload) {
+  return [
+    `Reran job ${payload.sourceJobId} as ${payload.jobId}.`,
+    `Status: ${payload.status}.`,
+    payload.summary ? `Summary: ${payload.summary}` : null,
+    payload.logPath ? `Log: ${payload.logPath}` : null,
+    ""
+  ].filter((value) => value !== null).join("\n");
 }

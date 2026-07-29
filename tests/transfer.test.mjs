@@ -8,9 +8,14 @@ import {
   buildHandoffEnvelope,
   buildHandoffPrompt,
   readClaudeTranscript,
-  resolveClaudeSessionPath
+  resolveClaudeSessionPath,
+  TRANSCRIPT_PATH_ENV
 } from "../plugins/grok/scripts/lib/claude-session-transfer.mjs";
-import { tempDir } from "./helpers.mjs";
+import { COMPANION, fakeGrokEnv, initRepo, run, tempDir } from "./helpers.mjs";
+
+function runCompanion(args, options) {
+  return run(process.execPath, [COMPANION, ...args], options);
+}
 
 function writeJsonl(file, records) {
   const source = records
@@ -146,4 +151,85 @@ test("source hash is stable and the absolute source path stays out of the model 
   assert.equal(envelope.metadata.sourceSha256, expected);
   assert.match(envelope.prompt, /path redacted/);
   assert.equal(envelope.prompt.includes(file), false);
+});
+
+test("transfer uses GROK_COMPANION_TRANSCRIPT_PATH when --source is omitted", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const transcript = path.join(root, "from-env.jsonl");
+  fs.writeFileSync(
+    transcript,
+    [
+      JSON.stringify({ type: "user", message: { content: "env-sourced handoff" } }),
+      JSON.stringify({ type: "assistant", message: { content: "ack" } })
+    ].join("\n"),
+    "utf8"
+  );
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(path.join(root, "state"), {
+    FAKE_GROK_CAPTURE: capture,
+    [TRANSCRIPT_PATH_ENV]: transcript
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = runCompanion(["transfer", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.includedTurns, 2);
+  const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.match(captured.prompt, /env-sourced handoff/);
+  assert.equal(captured.prompt.includes(transcript), false);
+});
+
+test("transfer fails with a clear message when the transcript source is missing", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"));
+  // Ensure the ambient env var cannot satisfy the default path.
+  delete env[TRANSCRIPT_PATH_ENV];
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = runCompanion(["transfer", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.notEqual(result.status, 0);
+  assert.match(
+    `${result.stderr}\n${result.stdout}`,
+    /Could not identify the current Claude transcript|Retry with --source/i
+  );
+});
+
+test("transfer fails when the transcript file does not exist", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const missing = path.join(root, "no-such-session.jsonl");
+  const env = fakeGrokEnv(path.join(root, "state"), {
+    [TRANSCRIPT_PATH_ENV]: missing
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = runCompanion(["transfer", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /Claude session file not found/i);
+});
+
+test("transfer fails when the source is not a .jsonl file", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const txt = path.join(root, "session.txt");
+  fs.writeFileSync(txt, "not jsonl\n", "utf8");
+  const env = fakeGrokEnv(path.join(root, "state"), {
+    [TRANSCRIPT_PATH_ENV]: txt
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = runCompanion(["transfer", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /must be a JSONL file/i);
 });

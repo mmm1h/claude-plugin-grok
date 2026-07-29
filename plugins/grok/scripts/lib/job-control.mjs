@@ -1,9 +1,22 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { isProcessAlive, terminateProcessTree } from "./process.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  getConfig,
+  listJobs,
+  readJobFile,
+  readJobRerunPayload,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveJobRerunFile,
+  updateState,
+  upsertJob,
+  writeJobFile,
+  writeJobRerunPayload
+} from "./state.mjs";
 import {
   appendLogLine,
   CLAUDE_SESSION_ID_ENV,
@@ -13,10 +26,15 @@ import {
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
+export const DEFAULT_PROGRESS_PREVIEW_LINES = 4;
 /** Leave headroom under the SessionEnd hook timeout (60s). */
 export const DEFAULT_SESSION_END_CANCEL_BUDGET_MS = 55_000;
 /** Only the trailing slice of job logs is scanned for status progress previews. */
 export const PROGRESS_PREVIEW_TAIL_BYTES = 64 * 1024;
+/** Default log lines returned by the logs command. */
+export const DEFAULT_LOG_TAIL_LINES = 80;
+/** Exit code when status/result --wait times out while the job is still active. */
+export const WAIT_TIMEOUT_EXIT_CODE = 124;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -78,7 +96,7 @@ function readLogTail(logPath, maxBytes = PROGRESS_PREVIEW_TAIL_BYTES) {
   }
 }
 
-function progressPreview(logPath, maxLines = 4) {
+function progressPreview(logPath, maxLines = DEFAULT_PROGRESS_PREVIEW_LINES) {
   if (!logPath || !fs.existsSync(logPath)) {
     return [];
   }
@@ -98,6 +116,7 @@ function progressPreview(logPath, maxLines = 4) {
 
 export function enrichJob(job, options = {}) {
   const active = job.status === "queued" || job.status === "running";
+  const maxProgressLines = options.maxProgressLines ?? DEFAULT_PROGRESS_PREVIEW_LINES;
   return {
     ...job,
     phase: job.phase ?? job.status ?? "unknown",
@@ -105,8 +124,31 @@ export function enrichJob(job, options = {}) {
     duration: active
       ? null
       : (formatDuration(job.durationMs) ?? duration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)),
-    progressPreview: active || job.status === "failed" ? progressPreview(job.logPath, options.maxProgressLines) : []
+    progressPreview: active || job.status === "failed" ? progressPreview(job.logPath, maxProgressLines) : []
   };
+}
+
+/**
+ * Persist a minimal rerun sidecar so terminal jobs remain re-queueable even
+ * though tracked-jobs strips `request` from the finished job record.
+ */
+export function saveJobRerunSnapshot(workspaceRoot, job) {
+  if (!job?.id || !job?.request) {
+    return null;
+  }
+  return writeJobRerunPayload(workspaceRoot, job.id, {
+    kind: job.kind,
+    title: job.title,
+    summary: job.summary,
+    write: Boolean(job.write),
+    sessionId: job.sessionId ?? null,
+    sessionConfirmed: Boolean(job.sessionConfirmed),
+    request: job.request
+  });
+}
+
+export function loadJobRerunSnapshot(workspaceRoot, jobId) {
+  return readJobRerunPayload(workspaceRoot, jobId);
 }
 
 function persistJob(workspaceRoot, job) {
@@ -398,35 +440,59 @@ export function readStoredJob(workspaceRoot, jobId) {
   return fs.existsSync(file) ? readJobFile(file) : null;
 }
 
+function applyJobFilters(jobs, options = {}) {
+  let filtered = jobs;
+  if (options.kind) {
+    const kind = String(options.kind).toLowerCase();
+    filtered = filtered.filter((job) => String(job.kind ?? "").toLowerCase() === kind);
+  }
+  if (options.status) {
+    const status = String(options.status).toLowerCase();
+    filtered = filtered.filter((job) => String(job.status ?? "").toLowerCase() === status);
+  }
+  return filtered;
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot, options), options));
-  const selected = options.all ? jobs : jobs.slice(0, options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS);
+  const enrichOptions = { maxProgressLines: options.maxProgressLines };
+  const jobs = applyJobFilters(
+    sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot, options), options)),
+    options
+  );
+  const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
+  const selected = options.all ? jobs : jobs.slice(0, maxJobs);
   const running = jobs
     .filter((job) => ["queued", "running"].includes(job.status))
-    .map(enrichJob);
+    .map((job) => enrichJob(job, enrichOptions));
   const latestFinishedRaw = jobs.find((job) => !["queued", "running"].includes(job.status)) ?? null;
-  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw) : null;
+  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, enrichOptions) : null;
   const recent = selected
     .filter((job) => !["queued", "running"].includes(job.status) && job.id !== latestFinished?.id)
-    .map(enrichJob);
+    .map((job) => enrichJob(job, enrichOptions));
   return {
     workspaceRoot,
     reviewGateEnabled: Boolean(getConfig(workspaceRoot).stopReviewGate),
-    jobs: selected.map(enrichJob),
+    jobs: selected.map((job) => enrichJob(job, enrichOptions)),
     running,
     latestFinished,
-    recent
+    recent,
+    filters: {
+      kind: options.kind ?? null,
+      status: options.status ?? null,
+      limit: options.all ? null : maxJobs,
+      all: Boolean(options.all)
+    }
   };
 }
 
-export function buildSingleJobSnapshot(cwd, reference) {
+export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const selected = matchReference(sortJobsNewestFirst(reconciledJobs(workspaceRoot)), reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /grok:status to list known jobs.`);
   }
-  return { workspaceRoot, job: enrichJob(selected) };
+  return { workspaceRoot, job: enrichJob(selected, { maxProgressLines: options.maxProgressLines }) };
 }
 
 export function resolveResultJob(cwd, reference, options = {}) {
@@ -456,12 +522,319 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     }
     return { workspaceRoot, job: selected };
   }
-  const scoped = filterCurrentSession(active, options);
+  const scoped = applyJobFilters(filterCurrentSession(active, options), options);
   if (scoped.length === 1) {
     return { workspaceRoot, job: scoped[0] };
   }
   if (scoped.length > 1) {
-    throw new Error("Multiple Grok jobs are active. Pass a job id to /grok:cancel.");
+    throw new Error("Multiple Grok jobs are active. Pass a job id to /grok:cancel, or use --all.");
   }
   throw new Error("No active Grok jobs to cancel.");
+}
+
+/**
+ * Resolve every active job eligible for bulk cancel.
+ * Defaults to the current Claude session unless options.all is set.
+ */
+export function resolveCancelableJobs(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const active = sortJobsNewestFirst(listJobs(workspaceRoot))
+    .filter((job) => ["queued", "running"].includes(job.status));
+  const scoped = applyJobFilters(filterCurrentSession(active, options), options);
+  return { workspaceRoot, jobs: scoped };
+}
+
+function parseDurationToMs(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`Invalid duration: ${value}`);
+    }
+    return value;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (/^\d+$/.test(text)) {
+    return Number(text);
+  }
+  const match = text.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/);
+  if (!match) {
+    throw new Error(`Invalid duration "${value}". Use e.g. 7d, 24h, 90m, 30s, or milliseconds.`);
+  }
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const multipliers = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  return amount * multipliers[unit];
+}
+
+export function parseDurationMs(value) {
+  return parseDurationToMs(value);
+}
+
+function jobAgeMs(job, now = Date.now()) {
+  const stamp = Date.parse(job.updatedAt ?? job.completedAt ?? job.createdAt ?? "");
+  return Number.isFinite(stamp) ? Math.max(0, now - stamp) : 0;
+}
+
+/**
+ * Select jobs for cleanup. Active (queued/running) jobs are never selected.
+ */
+export function selectJobsForCleanup(jobs, options = {}) {
+  const now = options.nowMs ?? Date.now();
+  const keep = options.keep == null ? null : Number(options.keep);
+  if (keep != null && (!Number.isInteger(keep) || keep < 0)) {
+    throw new Error("--keep must be a non-negative integer.");
+  }
+  const olderThanMs = options.olderThanMs ?? parseDurationToMs(options.olderThan);
+  const terminal = sortJobsNewestFirst(jobs)
+    .filter((job) => !["queued", "running"].includes(job.status));
+
+  let candidates = terminal;
+  if (olderThanMs != null) {
+    candidates = candidates.filter((job) => jobAgeMs(job, now) >= olderThanMs);
+  }
+  if (keep != null) {
+    // Keep the newest `keep` terminal jobs; delete the rest (intersect with older-than when set).
+    const protectedIds = new Set(terminal.slice(0, keep).map((job) => job.id));
+    candidates = candidates.filter((job) => !protectedIds.has(job.id));
+  }
+  if (olderThanMs == null && keep == null) {
+    // Default: keep the newest DEFAULT_MAX_STATUS_JOBS * index-friendly set — require an explicit filter.
+    throw new Error("Pass --older-than <duration> and/or --keep <N> to select jobs for cleanup.");
+  }
+  return candidates;
+}
+
+function unlinkIfExists(target) {
+  try {
+    if (target && fs.existsSync(target)) {
+      fs.unlinkSync(target);
+      return true;
+    }
+  } catch {
+    // Best-effort cleanup.
+  }
+  return false;
+}
+
+/**
+ * Remove terminal jobs from the index and delete their on-disk artifacts.
+ */
+export function cleanupJobs(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = listJobs(workspaceRoot);
+  const selected = selectJobsForCleanup(jobs, options);
+  const dryRun = Boolean(options.dryRun);
+  const removed = [];
+
+  for (const job of selected) {
+    const paths = {
+      jobFile: resolveJobFile(workspaceRoot, job.id),
+      logFile: job.logPath || resolveJobLogFile(workspaceRoot, job.id),
+      rerunFile: resolveJobRerunFile(workspaceRoot, job.id)
+    };
+    if (!dryRun) {
+      unlinkIfExists(paths.jobFile);
+      unlinkIfExists(paths.logFile);
+      unlinkIfExists(paths.rerunFile);
+    }
+    removed.push({
+      id: job.id,
+      kind: job.kind,
+      status: job.status,
+      updatedAt: job.updatedAt ?? null,
+      paths
+    });
+  }
+
+  if (!dryRun && removed.length > 0) {
+    const removeIds = new Set(removed.map((entry) => entry.id));
+    // Allow empty index when every job is intentionally deleted.
+    updateState(workspaceRoot, (state) => {
+      state.jobs = state.jobs.filter((job) => !removeIds.has(job.id));
+      state.__allowEmptyJobs = true;
+    });
+  }
+
+  return {
+    workspaceRoot,
+    dryRun,
+    removedCount: removed.length,
+    removed
+  };
+}
+
+/**
+ * Bundle a finished (or any) job into a portable export directory / archive payload.
+ */
+export function exportJobBundle(cwd, reference, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot));
+  const selected = matchReference(jobs, reference);
+  if (!selected) {
+    throw new Error(`No job found for "${reference}".`);
+  }
+  const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
+  const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
+  const rerunPath = resolveJobRerunFile(workspaceRoot, selected.id);
+  let logText = null;
+  if (logPath && fs.existsSync(logPath)) {
+    logText = fs.readFileSync(logPath, "utf8");
+  }
+  let rerun = null;
+  if (fs.existsSync(rerunPath)) {
+    try {
+      rerun = JSON.parse(fs.readFileSync(rerunPath, "utf8"));
+    } catch {
+      rerun = null;
+    }
+  }
+  const bundle = {
+    exportedAt: nowIso(),
+    workspaceRoot,
+    job: stored,
+    log: logText,
+    rerun
+  };
+
+  const outPath = options.out
+    ? path.resolve(cwd, options.out)
+    : path.join(workspaceRoot, `${selected.id}.export.json`);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
+  return {
+    workspaceRoot,
+    jobId: selected.id,
+    outPath,
+    bytes: Buffer.byteLength(JSON.stringify(bundle), "utf8"),
+    hasLog: logText != null,
+    hasRerun: rerun != null
+  };
+}
+
+/**
+ * Read job log lines (tail). Returns structured payload for the logs command.
+ */
+export function readJobLogs(cwd, reference, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot));
+  const selected = reference
+    ? matchReference(jobs, reference)
+    : (jobs[0] ?? null);
+  if (!selected) {
+    throw new Error(reference
+      ? `No job found for "${reference}".`
+      : "No Grok jobs found. Pass a job id to /grok:logs.");
+  }
+  const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
+  const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
+  const tail = options.tail == null ? DEFAULT_LOG_TAIL_LINES : Number(options.tail);
+  if (!Number.isFinite(tail) || tail < 0 || !Number.isInteger(tail)) {
+    throw new Error("--tail must be a non-negative integer.");
+  }
+  if (!logPath || !fs.existsSync(logPath)) {
+    return {
+      workspaceRoot,
+      jobId: selected.id,
+      logPath: logPath ?? null,
+      exists: false,
+      lines: [],
+      totalLines: 0,
+      tail
+    };
+  }
+  const text = fs.readFileSync(logPath, "utf8");
+  const allLines = text.split(/\r?\n/);
+  // Drop trailing empty line from final newline.
+  if (allLines.length && allLines[allLines.length - 1] === "") {
+    allLines.pop();
+  }
+  const lines = tail === 0 ? [] : allLines.slice(-tail);
+  return {
+    workspaceRoot,
+    jobId: selected.id,
+    logPath,
+    exists: true,
+    lines,
+    totalLines: allLines.length,
+    tail
+  };
+}
+
+/**
+ * Resolve a confirmed Grok session for explicit --session-id / --resume-job.
+ * Does not require the current Claude session match (unlike findLatestTaskSession).
+ */
+export function resolveResumeTarget(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot, options));
+
+  if (options.resumeJob) {
+    const selected = matchReference(jobs, options.resumeJob);
+    if (!selected) {
+      throw new Error(`No job found for --resume-job "${options.resumeJob}".`);
+    }
+    if (selected.kind !== "task") {
+      throw new Error(`Job ${selected.id} is kind "${selected.kind}"; only task jobs are resumable.`);
+    }
+    if (["queued", "running"].includes(selected.status)) {
+      throw new Error(`Cannot resume job ${selected.id} while it is still ${selected.status}.`);
+    }
+    if (!selected.sessionId || !selected.sessionConfirmed) {
+      throw new Error(
+        `Job ${selected.id} has no confirmed Grok session to resume `
+        + `(sessionId=${selected.sessionId ?? "none"}, confirmed=${Boolean(selected.sessionConfirmed)}).`
+      );
+    }
+    if (options.sessionId && options.sessionId !== selected.sessionId) {
+      throw new Error(
+        `--session-id "${options.sessionId}" does not match job ${selected.id} session ${selected.sessionId}.`
+      );
+    }
+    return {
+      sessionId: selected.sessionId,
+      source: "resume-job",
+      jobId: selected.id,
+      status: selected.status,
+      summary: selected.summary,
+      updatedAt: selected.updatedAt,
+      sessionConfirmed: true,
+      resumable: Boolean(selected.resumable)
+    };
+  }
+
+  if (options.sessionId) {
+    const sessionId = String(options.sessionId).trim();
+    if (!sessionId) {
+      throw new Error("--session-id requires a non-empty value.");
+    }
+    const matches = jobs.filter((job) =>
+      job.kind === "task"
+      && job.sessionId === sessionId
+      && job.sessionConfirmed === true
+    );
+    if (matches.length === 0) {
+      throw new Error(
+        `No confirmed Grok task session "${sessionId}" was found in this workspace. `
+        + "Use a session id from a previous /grok:result or /grok:status."
+      );
+    }
+    const preferred = matches.find((job) => job.resumable) ?? matches[0];
+    if (["queued", "running"].includes(preferred.status)) {
+      throw new Error(`Cannot resume session ${sessionId} while job ${preferred.id} is still ${preferred.status}.`);
+    }
+    return {
+      sessionId,
+      source: "session-id",
+      jobId: preferred.id,
+      status: preferred.status,
+      summary: preferred.summary,
+      updatedAt: preferred.updatedAt,
+      sessionConfirmed: true,
+      resumable: Boolean(preferred.resumable)
+    };
+  }
+
+  return null;
 }

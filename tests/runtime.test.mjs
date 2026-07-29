@@ -257,7 +257,7 @@ test("status --wait timeout returns the active snapshot and remains cancellable"
     ["status", jobId, "--wait", "--timeout-ms", "1", "--json", "--cwd", repo],
     { env, cwd: repo }
   );
-  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(waited.status, 124, waited.stderr);
   const payload = JSON.parse(waited.stdout);
   assert.equal(payload.waitedJobId, jobId);
   assert.equal(payload.waitTimedOut, true);
@@ -664,4 +664,334 @@ test("task rejects oversized --prompt-file before invoking Grok", (t) => {
   assert.match(response.stderr, /exceeds the maximum/i);
   assert.match(response.stderr, /16/);
   assert.equal(fs.existsSync(capture), false);
+});
+
+test("task --resume without prompt injects the default continue prompt", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(state, { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-continue" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const first = runCompanion(["task", "--json", "--cwd", repo, "seed session"], { env, cwd: repo });
+  assert.equal(first.status, 0, first.stderr);
+  const sessionId = JSON.parse(first.stdout).sessionId;
+  const capture = path.join(root, "continue-capture.json");
+  const resumed = runCompanion(["task", "--resume", "--json", "--cwd", repo], {
+    env: { ...env, FAKE_GROK_CAPTURE: capture },
+    cwd: repo
+  });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.equal(captured.resumeSessionId, sessionId);
+  assert.match(captured.prompt, /Continue from where you left off/i);
+});
+
+test("task --session-id and --resume-job resume a confirmed session outside auto-candidate scope", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const envA = fakeGrokEnv(state, { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-owner" });
+  const envB = fakeGrokEnv(state, { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-other" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const first = runCompanion(["task", "--json", "--cwd", repo, "owned task"], { env: envA, cwd: repo });
+  assert.equal(first.status, 0, first.stderr);
+  const sessionId = JSON.parse(first.stdout).sessionId;
+  const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env: envA, cwd: repo });
+  const jobId = JSON.parse(status.stdout).jobs[0].id;
+
+  // Other Claude session has no auto-candidate, but explicit flags still work.
+  const candidateB = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envB, cwd: repo });
+  assert.equal(JSON.parse(candidateB.stdout).available, false);
+
+  const bySession = path.join(root, "by-session.json");
+  const resumedBySession = runCompanion(
+    ["task", "--session-id", sessionId, "--json", "--cwd", repo, "continue via session id"],
+    { env: { ...envB, FAKE_GROK_CAPTURE: bySession }, cwd: repo }
+  );
+  assert.equal(resumedBySession.status, 0, resumedBySession.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(bySession, "utf8")).resumeSessionId, sessionId);
+
+  const byJob = path.join(root, "by-job.json");
+  const resumedByJob = runCompanion(
+    ["task", "--resume-job", jobId, "--json", "--cwd", repo, "continue via job id"],
+    { env: { ...envB, FAKE_GROK_CAPTURE: byJob }, cwd: repo }
+  );
+  assert.equal(resumedByJob.status, 0, resumedByJob.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(byJob, "utf8")).resumeSessionId, sessionId);
+
+  const missing = runCompanion(
+    ["task", "--session-id", "00000000-0000-4000-8000-000000000099", "--json", "--cwd", repo, "nope"],
+    { env: envB, cwd: repo }
+  );
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /No confirmed Grok task session/);
+});
+
+test("review and transfer accept --timeout-ms", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 11;\n", "utf8");
+  const transcript = path.join(root, "session.jsonl");
+  fs.writeFileSync(
+    transcript,
+    [
+      JSON.stringify({ type: "user", message: { content: "timeout handoff" } }),
+      JSON.stringify({ type: "assistant", message: { content: "ack" } })
+    ].join("\n"),
+    "utf8"
+  );
+  const env = fakeGrokEnv(path.join(root, "state"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const review = runCompanion(
+    ["review", "--wait", "--json", "--timeout-ms", "60000", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(review.status, 0, review.stderr);
+
+  const transfer = runCompanion(
+    ["transfer", "--json", "--timeout-ms", "60000", "--source", transcript, "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(transfer.status, 0, transfer.stderr);
+  assert.equal(JSON.parse(transfer.stdout).includedTurns, 2);
+
+  const invalid = runCompanion(
+    ["review", "--wait", "--json", "--timeout-ms", "0", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /timeout-ms must be a positive number/i);
+});
+
+test("rerun requeues a finished job from the request sidecar", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(state);
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const first = runCompanion(["task", "--json", "--cwd", repo, "original prompt for rerun"], { env, cwd: repo });
+  assert.equal(first.status, 0, first.stderr);
+  const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env, cwd: repo });
+  const sourceId = JSON.parse(status.stdout).jobs[0].id;
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, sourceId), "utf8"));
+  assert.equal(stored.request, undefined);
+
+  const capture = path.join(root, "rerun-capture.json");
+  const rerun = runCompanion(["rerun", sourceId, "--json", "--cwd", repo], {
+    env: { ...env, FAKE_GROK_CAPTURE: capture },
+    cwd: repo
+  });
+  assert.equal(rerun.status, 0, rerun.stderr);
+  const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.match(captured.prompt, /original prompt for rerun/);
+});
+
+test("logs and status --progress-lines expose job log content", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "4000" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "log progress task"],
+    { env, cwd: repo }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  await waitForJob(repo, env, jobId, (job) => job.status === "running" && job.sessionConfirmed === true);
+
+  const logs = runCompanion(["logs", jobId, "--tail", "20", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(logs.status, 0, logs.stderr);
+  const logPayload = JSON.parse(logs.stdout);
+  assert.equal(logPayload.jobId, jobId);
+  assert.equal(logPayload.exists, true);
+  assert.ok(logPayload.lines.length > 0);
+
+  const status = runCompanion(
+    ["status", jobId, "--progress-lines", "10", "--json", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(status.status, 0, status.stderr);
+  const job = JSON.parse(status.stdout).job;
+  assert.ok(Array.isArray(job.progressPreview));
+
+  runCompanion(["cancel", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+});
+
+test("cleanup dry-run and export preserve job evidence", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(state);
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const first = runCompanion(["task", "--json", "--cwd", repo, "cleanup target"], { env, cwd: repo });
+  assert.equal(first.status, 0, first.stderr);
+  const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env, cwd: repo });
+  const jobId = JSON.parse(status.stdout).jobs[0].id;
+
+  const outPath = path.join(root, "bundle.json");
+  const exported = runCompanion(["export", jobId, "--out", outPath, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(exported.status, 0, exported.stderr);
+  const exportPayload = JSON.parse(exported.stdout);
+  assert.equal(exportPayload.jobId, jobId);
+  assert.equal(exportPayload.hasRerun, true);
+  assert.equal(fs.existsSync(outPath), true);
+  const bundle = JSON.parse(fs.readFileSync(outPath, "utf8"));
+  assert.equal(bundle.job.id, jobId);
+  assert.ok(bundle.rerun?.request?.prompt);
+
+  const dry = runCompanion(["cleanup", "--keep", "0", "--dry-run", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(dry.status, 0, dry.stderr);
+  const dryPayload = JSON.parse(dry.stdout);
+  assert.equal(dryPayload.dryRun, true);
+  assert.ok(dryPayload.removedCount >= 1);
+  assert.equal(fs.existsSync(resolveJobFile(repo, jobId)), true);
+
+  const cleaned = runCompanion(["cleanup", "--keep", "0", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(cleaned.status, 0, cleaned.stderr);
+  assert.equal(fs.existsSync(resolveJobFile(repo, jobId)), false);
+});
+
+test("status filters by kind/status/limit and cancel --all cancels active jobs", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "10000" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const a = runCompanion(["task", "--background", "--json", "--cwd", repo, "cancel all a"], { env, cwd: repo });
+  const b = runCompanion(["task", "--background", "--json", "--cwd", repo, "cancel all b"], { env, cwd: repo });
+  assert.equal(a.status, 0, a.stderr);
+  assert.equal(b.status, 0, b.stderr);
+  const idA = JSON.parse(a.stdout).jobId;
+  const idB = JSON.parse(b.stdout).jobId;
+  await waitForJob(repo, env, idA, (job) => job.status === "running");
+  await waitForJob(repo, env, idB, (job) => job.status === "running");
+
+  const filtered = runCompanion(
+    ["status", "--kind", "task", "--status", "running", "--limit", "1", "--json", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(filtered.status, 0, filtered.stderr);
+  const snapshot = JSON.parse(filtered.stdout);
+  assert.ok(snapshot.jobs.every((job) => job.kind === "task" && job.status === "running"));
+  assert.ok(snapshot.jobs.length <= 1);
+
+  const cancelled = runCompanion(["cancel", "--all", "--kind", "task", "--json", "--cwd", repo], {
+    env,
+    cwd: repo,
+    timeout: 30_000
+  });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  const cancelPayload = JSON.parse(cancelled.stdout);
+  assert.ok(cancelPayload.requestedCount >= 2);
+  assert.equal(cancelPayload.cancelledCount, cancelPayload.requestedCount);
+});
+
+test("status --wait --with-result returns the finished job result", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "wait with result"],
+    { env, cwd: repo }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const waited = runCompanion(
+    ["status", jobId, "--wait", "--with-result", "--timeout-ms", "20000", "--json", "--cwd", repo],
+    { env, cwd: repo, timeout: 25_000 }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  const payload = JSON.parse(waited.stdout);
+  assert.equal(payload.waitTimedOut, false);
+  assert.equal(payload.result.status, "completed");
+  assert.match(payload.result.result.rawOutput, /FAKE_GROK_OK/);
+});
+
+test("transfer --background enqueues and completes via status/result", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  // Minimal Claude transcript JSONL for transfer source.
+  const transcriptPath = path.join(root, "session.jsonl");
+  fs.writeFileSync(
+    transcriptPath,
+    [
+      JSON.stringify({ type: "user", message: { content: "hello transfer" } }),
+      JSON.stringify({ type: "assistant", message: { content: "ack" } })
+    ].join("\n"),
+    "utf8"
+  );
+  const env = fakeGrokEnv(state);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(
+    ["transfer", "--background", "--source", transcriptPath, "--json", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const waited = runCompanion(
+    ["status", jobId, "--wait", "--timeout-ms", "20000", "--json", "--cwd", repo],
+    { env, cwd: repo, timeout: 25_000 }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const result = runCompanion(["result", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).kind, "transfer");
+});
+
+test("usage lists new commands and task resume flags", (t) => {
+  const response = runCompanion(["help"], { env: fakeGrokEnv(tempDir()), cwd: process.cwd() });
+  assert.equal(response.status, 0, response.stderr);
+  assert.match(response.stdout, /--session-id/);
+  assert.match(response.stdout, /--resume-job/);
+  assert.match(response.stdout, /--stop-review/);
+  assert.match(response.stdout, /--timeout-ms/);
+  assert.match(response.stdout, /\blogs\b/);
+  assert.match(response.stdout, /\bcleanup\b/);
+  assert.match(response.stdout, /\bexport\b/);
+  assert.match(response.stdout, /\brerun\b/);
+  assert.match(response.stdout, /--with-result/);
+  assert.match(response.stdout, /cancel .*--all/);
 });

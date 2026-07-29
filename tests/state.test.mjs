@@ -238,6 +238,52 @@ test("status snapshot exposes partitions and job references accept unique prefix
   assert.throws(() => buildSingleJobSnapshot(root, "task-alpha"), /ambiguous/);
 });
 
+test("buildStatusSnapshot filters by Claude session unless --all is set", (t) => {
+  const root = tempDir();
+  const stateHome = path.join(root, "state");
+  const previous = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = stateHome;
+  t.after(() => {
+    previous === undefined ? delete process.env.GROK_COMPANION_HOME : process.env.GROK_COMPANION_HOME = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  saveState(root, {
+    config: {},
+    jobs: [
+      {
+        id: "task-sess-a",
+        kind: "task",
+        status: "completed",
+        phase: "completed",
+        claudeSessionId: "claude-a",
+        summary: "from session a",
+        updatedAt: "2026-07-29T09:02:00.000Z"
+      },
+      {
+        id: "task-sess-b",
+        kind: "task",
+        status: "completed",
+        phase: "completed",
+        claudeSessionId: "claude-b",
+        summary: "from session b",
+        updatedAt: "2026-07-29T09:01:00.000Z"
+      }
+    ]
+  });
+
+  const filtered = buildStatusSnapshot(root, {
+    env: { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-a" }
+  });
+  assert.deepEqual(filtered.jobs.map((job) => job.id), ["task-sess-a"]);
+  assert.equal(filtered.latestFinished.id, "task-sess-a");
+
+  const all = buildStatusSnapshot(root, {
+    all: true,
+    env: { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-a" }
+  });
+  assert.deepEqual(all.jobs.map((job) => job.id).sort(), ["task-sess-a", "task-sess-b"]);
+});
+
 test("concurrent state writers retain every job", async (t) => {
   const root = tempDir();
   const stateHome = path.join(root, "state");

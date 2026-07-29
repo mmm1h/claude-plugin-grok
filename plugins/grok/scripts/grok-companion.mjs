@@ -27,16 +27,29 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   cancelTrackedJob,
+  cancelTrackedJobsParallel,
+  cleanupJobs,
+  exportJobBundle,
+  loadJobRerunSnapshot,
+  readJobLogs,
   readStoredJob,
   reconcileSessionJobs,
   resolveCancelableJob,
-  resolveResultJob
+  resolveCancelableJobs,
+  resolveResultJob,
+  resolveResumeTarget,
+  saveJobRerunSnapshot,
+  WAIT_TIMEOUT_EXIT_CODE
 } from "./lib/job-control.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import {
   renderCancelReport,
+  renderCleanupReport,
+  renderExportReport,
   renderJobStatusReport,
+  renderLogsReport,
   renderQueuedLaunch,
+  renderRerunReport,
   renderReviewResult,
   renderSetupReport,
   renderStatusReport,
@@ -76,7 +89,9 @@ const STOP_REVIEW_SCHEMA = JSON.parse(
 );
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240_000;
-const STATUS_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_STATUS_POLL_INTERVAL_MS = 1_000;
+/** Default continue prompt when resuming without an explicit instruction. */
+export const DEFAULT_CONTINUE_PROMPT = "Continue from where you left off. Pick up the unfinished work and complete it.";
 /** Hard cap for task prompts from args, stdin, or --prompt-file (bytes, UTF-8). */
 export const MAX_PROMPT_BYTES = 16 * 1024 * 1024;
 
@@ -85,13 +100,23 @@ function usage() {
     "Usage:",
     "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
     "  grok-companion.mjs review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]",
-    "  grok-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus...]",
-    "  grok-companion.mjs task [--background] [--write|--read-only] [--resume-last|--fresh] [--model <id>] [--effort <level>] [prompt]",
+    "                     [--model <id>] [--timeout-ms <ms>] [--json]",
+    "  grok-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]",
+    "                     [--model <id>] [--timeout-ms <ms>] [--json] [focus...]",
+    "  grok-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh]",
+    "                     [--session-id <id>] [--resume-job <job-id>] [--model <id>] [--effort <level>]",
+    "                     [--timeout-ms <ms>] [--prompt-file <path>] [--stop-review] [--json] [prompt]",
     "  grok-companion.mjs task-resume-candidate [--json]",
-    "  grok-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-    "  grok-companion.mjs status [job-id] [--all] [--json] [--wait] [--timeout-ms <ms>]",
-    "  grok-companion.mjs result [job-id] [--json]",
-    "  grok-companion.mjs cancel [job-id] [--json]"
+    "  grok-companion.mjs transfer [--background] [--source <claude-jsonl>] [--timeout-ms <ms>] [--json]",
+    "  grok-companion.mjs status [job-id] [--all] [--kind <kind>] [--status <status>] [--limit N]",
+    "                     [--progress-lines N] [--wait] [--with-result] [--timeout-ms <ms>]",
+    "                     [--poll-interval-ms <ms>] [--json]",
+    "  grok-companion.mjs result [job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
+    "  grok-companion.mjs cancel [job-id] [--all] [--kind <kind>] [--json]",
+    "  grok-companion.mjs logs [job-id] [--tail N] [--json]",
+    "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]",
+    "  grok-companion.mjs export <job-id> [--out <path>] [--json]",
+    "  grok-companion.mjs rerun [job-id] [--background] [--json]"
   ].join("\n");
 }
 
@@ -282,6 +307,7 @@ function buildReviewRequest(cwd, options, focus, adversarial) {
       REPOSITORY_CONTEXT: context.content
     }
   );
+  const timeoutMs = parseTimeoutMs(options["timeout-ms"], { allowNull: true });
   return {
     type: "review",
     cwd: context.repoRoot,
@@ -296,8 +322,39 @@ function buildReviewRequest(cwd, options, focus, adversarial) {
       inputMode: context.inputMode,
       collectionGuidance: context.collectionGuidance
     },
-    model: options.model ?? null
+    model: options.model ?? null,
+    timeoutMs
   };
+}
+
+function parseTimeoutMs(value, { allowNull = false } = {}) {
+  if (value == null || value === "") {
+    if (allowNull) {
+      return null;
+    }
+    throw new Error("--timeout-ms must be a positive number.");
+  }
+  const timeoutMs = Number(value);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("--timeout-ms must be a positive number.");
+  }
+  return timeoutMs;
+}
+
+function parsePositiveInt(value, flagName) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flagName} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeInt(value, flagName) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${flagName} must be a non-negative integer.`);
+  }
+  return parsed;
 }
 
 async function executeReview(request, onProgress) {
@@ -328,7 +385,8 @@ async function executeReview(request, onProgress) {
     write: false,
     sandbox: "read-only",
     jsonSchema: REVIEW_SCHEMA,
-    onProgress
+    onProgress,
+    timeoutMs: request.timeoutMs
   });
   const parsed = parseGrokStructuredOutput(result.stdout);
   const validationError = parsed.ok ? validateReviewResult(parsed.data) : null;
@@ -447,7 +505,8 @@ async function executeTransfer(request, onProgress) {
     cwd: request.cwd,
     prompt: request.prompt,
     write: false,
-    onProgress
+    onProgress,
+    timeoutMs: request.timeoutMs
   });
   const payload = {
     exitCode: result.exitCode,
@@ -518,6 +577,8 @@ function spawnWorker(cwd, jobId) {
 }
 
 function enqueue(job) {
+  // Sidecar before worker spawn so terminal strip of request still leaves a rerun path.
+  saveJobRerunSnapshot(job.workspaceRoot, job);
   const logPath = createJobLogFile(job.workspaceRoot, job.id, job.title);
   const queued = {
     ...job,
@@ -547,7 +608,7 @@ function enqueue(job) {
 
 async function handleReview(argv, adversarial) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "timeout-ms"],
     booleanOptions: ["json", "background", "wait"]
   });
   if (options.background && options.wait) {
@@ -570,13 +631,14 @@ async function handleReview(argv, adversarial) {
     const payload = enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
+    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
 
 async function handleTask(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "prompt-file", "model", "effort", "timeout-ms"],
+    valueOptions: ["cwd", "prompt-file", "model", "effort", "timeout-ms", "session-id", "resume-job"],
     booleanOptions: [
       "json",
       "background",
@@ -594,28 +656,48 @@ async function handleTask(argv) {
   if (options["stop-review"] && options.write) {
     throw new Error("Stop reviews are always read-only; do not pass --write.");
   }
-  if ((options["resume-last"] || options.resume) && options.fresh) {
-    throw new Error("Choose either --resume-last/--resume or --fresh.");
+  const wantsResume = Boolean(
+    options["resume-last"]
+    || options.resume
+    || options["session-id"]
+    || options["resume-job"]
+  );
+  if (wantsResume && options.fresh) {
+    throw new Error("Choose either a resume option (--resume/--resume-last/--session-id/--resume-job) or --fresh.");
+  }
+  if (options["session-id"] && options["resume-job"]) {
+    // Allowed together only when they agree; resolveResumeTarget validates the pair.
   }
   const cwd = commandCwd(options);
   requireAvailable(cwd);
   // Reclaim dead-PID "running" orphans before resume lookup / enqueue so they
   // cannot permanently block findLatestTaskSession.
   reconcileSessionJobs(resolveWorkspaceRoot(cwd));
-  const prompt = readPrompt(cwd, options, positionals);
+  let prompt = readPrompt(cwd, options, positionals);
   if (!prompt) {
-    throw new Error("Provide a task prompt, --prompt-file, or piped stdin.");
+    if (wantsResume) {
+      prompt = DEFAULT_CONTINUE_PROMPT;
+    } else {
+      throw new Error("Provide a task prompt, --prompt-file, or piped stdin.");
+    }
   }
-  const resume = options["resume-last"] || options.resume ? findLatestTaskSession(cwd) : null;
-  if ((options["resume-last"] || options.resume) && !resume) {
-    throw new Error("No resumable Grok task session was found for the current Claude session and workspace.");
+
+  let resume = null;
+  if (options["session-id"] || options["resume-job"]) {
+    resume = resolveResumeTarget(cwd, {
+      sessionId: options["session-id"] ?? null,
+      resumeJob: options["resume-job"] ?? null
+    });
+  } else if (options["resume-last"] || options.resume) {
+    resume = findLatestTaskSession(cwd);
+    if (!resume) {
+      throw new Error("No resumable Grok task session was found for the current Claude session and workspace.");
+    }
   }
+
   const stopReview = Boolean(options["stop-review"]);
   const write = stopReview ? false : !options["read-only"];
-  const timeoutMs = options["timeout-ms"] == null ? null : Number(options["timeout-ms"]);
-  if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
-    throw new Error("--timeout-ms must be a positive number.");
-  }
+  const timeoutMs = parseTimeoutMs(options["timeout-ms"], { allowNull: true });
   const kind = stopReview ? "stop-review" : "task";
   const title = stopReview ? "Grok Stop Review" : (resume ? "Grok Resumed Task" : "Grok Task");
   const sessionId = resume?.sessionId ?? randomUUID();
@@ -646,6 +728,7 @@ async function handleTask(argv) {
     const payload = enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
+    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
@@ -679,8 +762,8 @@ function handleTaskResumeCandidate(argv) {
 
 async function handleTransfer(argv) {
   const { options } = commandInput(argv, {
-    valueOptions: ["cwd", "source"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "source", "timeout-ms"],
+    booleanOptions: ["json", "background"]
   });
   const cwd = commandCwd(options);
   requireAvailable(cwd);
@@ -688,12 +771,14 @@ async function handleTransfer(argv) {
   const transcript = readClaudeTranscript(sourcePath);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const handoff = buildHandoffEnvelope({ cwd: workspaceRoot, sourcePath, transcript });
+  const timeoutMs = parseTimeoutMs(options["timeout-ms"], { allowNull: true });
   const request = {
     type: "transfer",
     cwd: workspaceRoot,
     sourcePath,
     prompt: handoff.prompt,
-    handoffMetadata: handoff.metadata
+    handoffMetadata: handoff.metadata,
+    timeoutMs
   };
   const job = makeJob({
     cwd: workspaceRoot,
@@ -703,16 +788,24 @@ async function handleTransfer(argv) {
     write: false,
     request
   });
-  await runForeground(job, options.json);
+  if (options.background) {
+    const payload = enqueue(job);
+    output(payload, renderQueuedLaunch(payload), options.json);
+  } else {
+    saveJobRerunSnapshot(job.workspaceRoot, job);
+    await runForeground(job, options.json);
+  }
 }
 
-async function waitForJob(cwd, reference, timeoutMs) {
+async function waitForJob(cwd, reference, timeoutMs, options = {}) {
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_STATUS_POLL_INTERVAL_MS;
+  const enrichOptions = { maxProgressLines: options.maxProgressLines };
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  let snapshot = buildSingleJobSnapshot(cwd, reference, enrichOptions);
   while (["queued", "running"].includes(snapshot.job.status) && Date.now() < deadline) {
     const remainingMs = Math.max(0, deadline - Date.now());
-    await new Promise((resolve) => setTimeout(resolve, Math.min(STATUS_POLL_INTERVAL_MS, remainingMs)));
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
+    snapshot = buildSingleJobSnapshot(cwd, reference, enrichOptions);
   }
   return {
     ...snapshot,
@@ -724,47 +817,161 @@ async function waitForJob(cwd, reference, timeoutMs) {
 
 async function handleStatus(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms"],
-    booleanOptions: ["json", "all", "wait"]
+    valueOptions: [
+      "cwd",
+      "timeout-ms",
+      "kind",
+      "status",
+      "limit",
+      "progress-lines",
+      "poll-interval-ms"
+    ],
+    booleanOptions: ["json", "all", "wait", "with-result"]
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
-  const timeoutMs = options["timeout-ms"] == null ? DEFAULT_STATUS_WAIT_TIMEOUT_MS : Number(options["timeout-ms"]);
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-    throw new Error("--timeout-ms must be a non-negative number.");
-  }
+  const timeoutMs = options["timeout-ms"] == null
+    ? DEFAULT_STATUS_WAIT_TIMEOUT_MS
+    : parseNonNegativeInt(options["timeout-ms"], "--timeout-ms");
+  const pollIntervalMs = options["poll-interval-ms"] == null
+    ? DEFAULT_STATUS_POLL_INTERVAL_MS
+    : parsePositiveInt(options["poll-interval-ms"], "--poll-interval-ms");
+  const maxProgressLines = options["progress-lines"] == null
+    ? undefined
+    : parseNonNegativeInt(options["progress-lines"], "--progress-lines");
+  const maxJobs = options.limit == null
+    ? undefined
+    : parsePositiveInt(options.limit, "--limit");
+
   if (options.wait && !reference) {
     throw new Error("`status --wait` requires a job id.");
   }
+  if (options["with-result"] && !options.wait) {
+    throw new Error("`--with-result` requires `--wait`.");
+  }
+  if (options["with-result"] && !reference) {
+    throw new Error("`status --wait --with-result` requires a job id.");
+  }
+
   if (reference) {
     const snapshot = options.wait
-      ? await waitForJob(cwd, reference, timeoutMs)
-      : buildSingleJobSnapshot(cwd, reference);
+      ? await waitForJob(cwd, reference, timeoutMs, { pollIntervalMs, maxProgressLines })
+      : buildSingleJobSnapshot(cwd, reference, { maxProgressLines });
+
+    if (options.wait && options["with-result"] && !snapshot.waitTimedOut) {
+      const stored = readStoredJob(snapshot.workspaceRoot, snapshot.job.id) ?? snapshot.job;
+      const payload = {
+        ...snapshot,
+        result: stored
+      };
+      output(payload, renderStoredJobResult(stored), options.json);
+      if (stored.status === "failed" || (stored.exitCode != null && stored.exitCode !== 0)) {
+        process.exitCode = stored.exitCode && stored.exitCode !== 0 ? stored.exitCode : 1;
+      }
+      return;
+    }
+
     output(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    if (snapshot.waitTimedOut) {
+      process.exitCode = WAIT_TIMEOUT_EXIT_CODE;
+    }
     return;
   }
-  const snapshot = buildStatusSnapshot(cwd, { all: options.all });
+
+  const snapshot = buildStatusSnapshot(cwd, {
+    all: options.all,
+    kind: options.kind ?? null,
+    status: options.status ?? null,
+    maxJobs,
+    maxProgressLines
+  });
   output(snapshot, renderStatusReport(snapshot), options.json);
 }
 
-function handleResult(argv) {
+async function handleResult(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json", "wait"]
   });
   const cwd = commandCwd(options);
-  const { workspaceRoot, job } = resolveResultJob(cwd, positionals[0] ?? "", { env: process.env });
+  const reference = positionals[0] ?? "";
+  if (options.wait) {
+    if (!reference) {
+      throw new Error("`result --wait` requires a job id.");
+    }
+    const timeoutMs = options["timeout-ms"] == null
+      ? DEFAULT_STATUS_WAIT_TIMEOUT_MS
+      : parseNonNegativeInt(options["timeout-ms"], "--timeout-ms");
+    const pollIntervalMs = options["poll-interval-ms"] == null
+      ? DEFAULT_STATUS_POLL_INTERVAL_MS
+      : parsePositiveInt(options["poll-interval-ms"], "--poll-interval-ms");
+    const snapshot = await waitForJob(cwd, reference, timeoutMs, { pollIntervalMs });
+    if (snapshot.waitTimedOut) {
+      output(snapshot, renderJobStatusReport(snapshot.job), options.json);
+      process.exitCode = WAIT_TIMEOUT_EXIT_CODE;
+      return;
+    }
+    const stored = readStoredJob(snapshot.workspaceRoot, snapshot.job.id) ?? snapshot.job;
+    output(stored, renderStoredJobResult(stored), options.json);
+    if (stored.status === "failed" || (stored.exitCode != null && stored.exitCode !== 0 && stored.status !== "cancelled")) {
+      process.exitCode = stored.exitCode && stored.exitCode !== 0 ? stored.exitCode : 1;
+    }
+    return;
+  }
+
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference, { env: process.env });
   const stored = readStoredJob(workspaceRoot, job.id) ?? job;
   output(stored, renderStoredJobResult(stored), options.json);
 }
 
-function handleCancel(argv) {
+async function handleCancel(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "kind"],
+    booleanOptions: ["json", "all"]
   });
   const cwd = commandCwd(options);
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, positionals[0] ?? "", { env: process.env });
+  const reference = positionals[0] ?? "";
+  if (options.all) {
+    if (reference) {
+      throw new Error("Pass either a job id or --all, not both.");
+    }
+    const { workspaceRoot, jobs } = resolveCancelableJobs(cwd, {
+      all: true,
+      kind: options.kind ?? null,
+      env: process.env
+    });
+    if (jobs.length === 0) {
+      throw new Error(options.kind
+        ? `No active Grok jobs of kind "${options.kind}" to cancel.`
+        : "No active Grok jobs to cancel.");
+    }
+    const results = await cancelTrackedJobsParallel(workspaceRoot, jobs, {
+      env: process.env,
+      reason: "cancel --all"
+    });
+    const payload = {
+      requestedCount: jobs.length,
+      cancelledCount: results.filter((entry) => entry.status === "cancelled").length,
+      results: results.map((entry, index) => ({
+        jobId: jobs[index].id,
+        previousStatus: entry.previousStatus,
+        status: entry.status,
+        delivered: entry.delivered,
+        method: entry.method,
+        errorMessage: entry.errorMessage
+      }))
+    };
+    output(payload, renderCancelReport(payload), options.json);
+    if (payload.cancelledCount !== payload.requestedCount) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, {
+    env: process.env,
+    kind: options.kind ?? null
+  });
   const cancellation = cancelTrackedJob(workspaceRoot, job, { env: process.env });
   const payload = {
     jobId: job.id,
@@ -777,6 +984,112 @@ function handleCancel(argv) {
   output(payload, renderCancelReport(payload), options.json);
   if (cancellation.status !== "cancelled") {
     process.exitCode = 1;
+  }
+}
+
+function handleLogs(argv) {
+  const { options, positionals } = commandInput(argv, {
+    valueOptions: ["cwd", "tail"],
+    booleanOptions: ["json"]
+  });
+  const cwd = commandCwd(options);
+  const reference = positionals[0] ?? "";
+  const tail = options.tail == null ? undefined : parseNonNegativeInt(options.tail, "--tail");
+  const payload = readJobLogs(cwd, reference, { tail });
+  output(payload, renderLogsReport(payload), options.json);
+}
+
+function handleCleanup(argv) {
+  const { options } = commandInput(argv, {
+    valueOptions: ["cwd", "older-than", "keep"],
+    booleanOptions: ["json", "dry-run"]
+  });
+  const cwd = commandCwd(options);
+  if (options["older-than"] == null && options.keep == null) {
+    throw new Error("Pass --older-than <duration> and/or --keep <N> to select jobs for cleanup.");
+  }
+  const keep = options.keep == null ? null : parseNonNegativeInt(options.keep, "--keep");
+  const payload = cleanupJobs(cwd, {
+    olderThan: options["older-than"] ?? null,
+    keep,
+    dryRun: Boolean(options["dry-run"])
+  });
+  output(payload, renderCleanupReport(payload), options.json);
+}
+
+function handleExport(argv) {
+  const { options, positionals } = commandInput(argv, {
+    valueOptions: ["cwd", "out"],
+    booleanOptions: ["json"]
+  });
+  const cwd = commandCwd(options);
+  const reference = positionals[0] ?? "";
+  if (!reference) {
+    throw new Error("`export` requires a job id.");
+  }
+  const payload = exportJobBundle(cwd, reference, { out: options.out ?? null });
+  output(payload, renderExportReport(payload), options.json);
+}
+
+async function handleRerun(argv) {
+  const { options, positionals } = commandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "background"]
+  });
+  const cwd = commandCwd(options);
+  requireAvailable(cwd);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const reference = positionals[0] ?? "";
+  if (!reference) {
+    throw new Error("`rerun` requires a job id.");
+  }
+  // Prefer the explicit job reference; fall back to finished-job resolution for prefixes.
+  let sourceJob;
+  try {
+    const resolved = resolveResultJob(cwd, reference, { env: process.env, all: true });
+    sourceJob = readStoredJob(resolved.workspaceRoot, resolved.job.id) ?? resolved.job;
+  } catch {
+    const snapshot = buildSingleJobSnapshot(cwd, reference);
+    sourceJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id) ?? snapshot.job;
+  }
+  if (["queued", "running"].includes(sourceJob.status)) {
+    throw new Error(`Job ${sourceJob.id} is still ${sourceJob.status}; cancel it or wait before rerunning.`);
+  }
+
+  const sidecar = loadJobRerunSnapshot(workspaceRoot, sourceJob.id);
+  const request = sidecar?.request ?? sourceJob.request ?? null;
+  if (!request || typeof request !== "object") {
+    throw new Error(
+      `No rerun payload found for job ${sourceJob.id}. `
+      + "Jobs finished before this companion version, or pruned without a sidecar, cannot be rerun."
+    );
+  }
+
+  const kind = sidecar?.kind ?? sourceJob.kind ?? request.type ?? "task";
+  const title = `Rerun: ${sidecar?.title ?? sourceJob.title ?? kind}`;
+  const summary = sidecar?.summary ?? sourceJob.summary ?? shorten(request.prompt ?? title);
+  const write = sidecar?.write ?? sourceJob.write ?? Boolean(request.write);
+  // Fresh job id; do not resume the prior Grok session unless the stored request already did.
+  const job = makeJob({
+    cwd: request.cwd ?? workspaceRoot,
+    kind,
+    title,
+    summary,
+    write,
+    request: { ...request },
+    sessionId: request.sessionId ?? null,
+    sessionConfirmed: Boolean(request.sessionConfirmed)
+  });
+
+  if (options.background) {
+    const payload = {
+      ...enqueue(job),
+      sourceJobId: sourceJob.id
+    };
+    output(payload, renderRerunReport(payload), options.json);
+  } else {
+    saveJobRerunSnapshot(job.workspaceRoot, job);
+    await runForeground(job, options.json);
   }
 }
 
@@ -844,10 +1157,22 @@ async function main() {
       await handleStatus(argv);
       break;
     case "result":
-      handleResult(argv);
+      await handleResult(argv);
       break;
     case "cancel":
-      handleCancel(argv);
+      await handleCancel(argv);
+      break;
+    case "logs":
+      handleLogs(argv);
+      break;
+    case "cleanup":
+      handleCleanup(argv);
+      break;
+    case "export":
+      handleExport(argv);
+      break;
+    case "rerun":
+      await handleRerun(argv);
       break;
     case "job-worker":
       await handleWorker(argv);

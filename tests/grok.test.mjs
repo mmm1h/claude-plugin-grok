@@ -735,3 +735,135 @@ test("runGrokHeadless does not detach and registers interrupt cleanup path", asy
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /FAKE_GROK_OK/);
 });
+
+test("streaming collector reassembles NDJSON split across stdout chunks", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // Half-line JSON across chunks: {"type":"te  +  xt","data":"A"}\n  then a second fragment.
+  const chunks = [
+    '{"type":"te',
+    'xt","data":"A"}\n{"type":"text","data":"B',
+    '"}\n{"type":"end"}\n'
+  ];
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "cross-chunk stream",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_STREAM_CHUNKS: JSON.stringify(chunks)
+    },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "AB");
+  assert.doesNotMatch(result.stdout, /\"type\":|Unparsed/);
+});
+
+test("streaming collector reassembles when FAKE_GROK_STREAM is sliced by byte size", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stream = [
+    JSON.stringify({ type: "text", data: "chunked-" }),
+    JSON.stringify({ type: "text", data: "answer" }),
+    JSON.stringify({ type: "end" })
+  ].join("\n") + "\n";
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "byte-sliced stream",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_STREAM: stream,
+      FAKE_GROK_STREAM_CHUNKS: "7"
+    },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.stdout, "chunked-answer");
+});
+
+test("fake Grok can crash mid-stream after N lines", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stream = [
+    JSON.stringify({ type: "text", data: "kept" }),
+    JSON.stringify({ type: "text", data: " should-not-appear" }),
+    JSON.stringify({ type: "end", data: { result: "final-should-not-appear" } })
+  ].join("\n") + "\n";
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "mid-stream crash",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_STREAM: stream,
+      FAKE_GROK_EXIT_AFTER_LINES: "1",
+      FAKE_GROK_EXIT_CODE: "1"
+    },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "kept");
+  assert.doesNotMatch(result.stdout, /should-not-appear|final-should-not-appear/);
+});
+
+test("fake Grok stderr flood is forwarded without failing a successful run", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const progress = [];
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "stderr flood",
+    write: false,
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_STDERR_FLOOD: "40"
+    },
+    onProgress: (line) => progress.push(line),
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /FAKE_GROK_OK/);
+  assert.ok(progress.filter((line) => /fake grok progress line /.test(line)).length >= 20);
+});
+
+test("non-zero exit still surfaces a legal stdout body", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "nonzero with body",
+    write: false,
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: {
+      ...process.env,
+      FAKE_GROK_OUTPUT: "LEGAL_BODY_DESPITE_EXIT",
+      FAKE_GROK_EXIT_CODE: "2"
+    },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.exitCode, 2);
+  assert.match(result.stdout, /LEGAL_BODY_DESPITE_EXIT/);
+});
