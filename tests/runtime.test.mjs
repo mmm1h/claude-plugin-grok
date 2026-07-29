@@ -5,6 +5,8 @@ import test from "node:test";
 
 import { COMPANION, fakeGrokEnv, initRepo, run, tempDir } from "./helpers.mjs";
 import { terminateProcessTree } from "../plugins/grok/scripts/lib/process.mjs";
+import { resolveJobFile, upsertJob, writeJobFile } from "../plugins/grok/scripts/lib/state.mjs";
+import { indexJobRecord } from "../plugins/grok/scripts/lib/tracked-jobs.mjs";
 
 const SESSION_HOOK = path.join(path.dirname(COMPANION), "session-lifecycle-hook.mjs");
 
@@ -73,6 +75,10 @@ test("review CLI spawns fake Grok and stores a foreground job", (t) => {
   const snapshot = JSON.parse(status.stdout);
   assert.equal(snapshot.jobs[0].kind, "review");
   assert.equal(snapshot.jobs[0].status, "completed");
+  assert.equal(snapshot.jobs[0].sessionConfirmed, false);
+  assert.equal(snapshot.jobs[0].resumable, false);
+  assert.equal(snapshot.jobs[0].exitCode, 0);
+  assert.ok(Number.isFinite(snapshot.jobs[0].durationMs));
 });
 
 test("review CLI fails closed when Grok returns invalid structured output", (t) => {
@@ -93,7 +99,7 @@ test("review CLI fails closed when Grok returns invalid structured output", (t) 
   assert.equal(payload.rawOutput, "not-json");
 });
 
-test("review CLI does not invoke Grok when diff context is truncated", (t) => {
+test("large review uses self-collect and invokes fake Grok with the read-only evidence surface", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
@@ -111,11 +117,73 @@ test("review CLI does not invoke Grok when diff context is truncated", (t) => {
     ["review", "--wait", "--json", "--scope", "working-tree", "--cwd", repo],
     { env, cwd: repo, timeout: 30_000 }
   );
-  assert.equal(response.status, 1, response.stderr);
+  assert.equal(response.status, 0, response.stderr);
   const payload = JSON.parse(response.stdout);
-  assert.equal(payload.context.truncated, true);
-  assert.match(payload.parseError, /refusing to invoke Grok on an incomplete diff/);
+  assert.equal(payload.context.inputMode, "self-collect");
+  assert.equal(payload.context.truncated, false);
+  assert.equal(payload.result.verdict, "approve");
+  assert.equal(fs.existsSync(capture), true);
+  const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.equal(captured.sandbox, "read-only");
+  assert.ok(captured.args.includes("read_file,grep,list_dir"));
+  assert.match(captured.prompt, /complete diff is intentionally not inline/i);
+  assert.match(captured.prompt, /## Unstaged Diff Stat/);
+  assert.doesNotMatch(captured.prompt, /## Unstaged Diff\n/);
+  assert.match(captured.prompt, /app\.js/);
+  assert.doesNotMatch(captured.prompt, /export const value39999/);
+});
+
+test("truly truncated stored review fails closed before invoking Grok", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(state, { FAKE_GROK_CAPTURE: capture });
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const id = "review-truncated-proof";
+  const job = {
+    id,
+    kind: "review",
+    title: "Grok Review",
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "forced truncated evidence",
+    write: false,
+    createdAt: new Date().toISOString(),
+    resultPath: resolveJobFile(repo, id),
+    request: {
+      type: "review",
+      cwd: repo,
+      prompt: "This prompt must never reach Grok.",
+      adversarial: false,
+      target: { mode: "working-tree", label: "working tree diff" },
+      context: { truncated: true, inputMode: "truncated-diff" },
+      model: null
+    }
+  };
+  writeJobFile(repo, id, job);
+  upsertJob(repo, indexJobRecord(job));
+
+  const worker = runCompanion(["job-worker", "--cwd", repo, "--job-id", id], { env, cwd: repo });
+  assert.equal(worker.status, 0, worker.stderr);
   assert.equal(fs.existsSync(capture), false);
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, id), "utf8"));
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.result.result, null);
+  assert.match(stored.result.parseError, /refusing to invoke Grok on an incomplete diff/);
 });
 
 test("background task detaches, completes, and can be read with result", async (t) => {
@@ -138,7 +206,11 @@ test("background task detaches, completes, and can be read with result", async (
     { env, cwd: repo, timeout: 25_000 }
   );
   assert.equal(waited.status, 0, waited.stderr);
-  const job = JSON.parse(waited.stdout).job;
+  const waitPayload = JSON.parse(waited.stdout);
+  assert.equal(waitPayload.waitedJobId, jobId);
+  assert.equal(waitPayload.waitTimedOut, false);
+  assert.equal(waitPayload.timeoutMs, 20_000);
+  const job = waitPayload.job;
   assert.equal(job.status, "completed");
   const result = runCompanion(["result", jobId, "--json", "--cwd", repo], { env, cwd: repo });
   assert.equal(result.status, 0, result.stderr);
@@ -148,6 +220,53 @@ test("background task detaches, completes, and can be read with result", async (
   assert.ok(stored.sessionId);
   assert.equal(stored.sessionConfirmed, true);
   assert.equal(stored.resumable, true);
+  assert.equal(stored.exitCode, 0);
+  assert.ok(Number.isFinite(stored.durationMs));
+});
+
+test("status --wait requires a job id", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const response = runCompanion(["status", "--wait", "--json", "--cwd", repo], {
+    env: fakeGrokEnv(path.join(root, "state")),
+    cwd: repo
+  });
+  assert.equal(response.status, 1);
+  assert.match(response.stderr, /status --wait.*requires a job id/i);
+  assert.equal(response.stdout, "");
+});
+
+test("status --wait timeout returns the active snapshot and remains cancellable", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "10000" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(["task", "--background", "--json", "--cwd", repo, "long wait"], { env, cwd: repo });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  await waitForJob(repo, env, jobId, (job) => job.status === "running");
+
+  const waited = runCompanion(
+    ["status", jobId, "--wait", "--timeout-ms", "1", "--json", "--cwd", repo],
+    { env, cwd: repo }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  const payload = JSON.parse(waited.stdout);
+  assert.equal(payload.waitedJobId, jobId);
+  assert.equal(payload.waitTimedOut, true);
+  assert.equal(payload.timeoutMs, 1);
+  assert.ok(["queued", "running"].includes(payload.job.status));
+
+  const cancelled = runCompanion(["cancel", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
 });
 
 test("running task exposes confirmed session telemetry before completion", async (t) => {
@@ -231,7 +350,13 @@ test("resume candidates are isolated by Claude session and active tasks block re
   assert.equal(first.status, 0, first.stderr);
   const firstSessionId = JSON.parse(first.stdout).sessionId;
   const candidateA = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envA, cwd: repo });
-  assert.equal(JSON.parse(candidateA.stdout).sessionId, firstSessionId);
+  const candidatePayload = JSON.parse(candidateA.stdout);
+  assert.equal(candidatePayload.sessionId, firstSessionId);
+  assert.equal(candidatePayload.status, "completed");
+  assert.equal(candidatePayload.summary, "first session task");
+  assert.ok(candidatePayload.updatedAt);
+  assert.equal(candidatePayload.sessionConfirmed, true);
+  assert.equal(candidatePayload.resumable, true);
   const candidateB = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envB, cwd: repo });
   assert.equal(JSON.parse(candidateB.stdout).available, false);
 
@@ -373,6 +498,7 @@ test("transfer CLI creates a read-only resumable handoff with fake Grok", (t) =>
   assert.match(payload.sourceSha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(payload.omissions.bad_json, 0);
   assert.ok(payload.sessionId);
+  assert.equal(payload.sessionConfirmed, false);
   const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
   assert.match(captured.prompt, /lossy handoff/);
   assert.match(captured.prompt, /Investigate the regression/);

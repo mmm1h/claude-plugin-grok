@@ -94,6 +94,8 @@ export function indexJobRecord(record) {
     cancelledAt: record.cancelledAt ?? null,
     terminationMethod: record.terminationMethod ?? null,
     terminationDelivered: record.terminationDelivered ?? null,
+    exitCode: record.exitCode ?? null,
+    durationMs: record.durationMs ?? null,
     errorMessage: record.errorMessage ?? null
   };
 }
@@ -165,6 +167,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       sessionId: execution.sessionId ?? completedBase.sessionId ?? null,
       sessionConfirmed,
       resumable: completedBase.kind === "task" && sessionConfirmed,
+      exitCode: execution.exitCode ?? execution.payload?.exitCode ?? null,
+      durationMs: execution.durationMs ?? execution.payload?.durationMs ?? null,
       result: execution.payload,
       rendered: execution.rendered,
       errorMessage: execution.errorMessage ?? null

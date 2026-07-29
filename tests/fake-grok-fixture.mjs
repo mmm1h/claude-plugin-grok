@@ -70,6 +70,10 @@ const defaultReview = {
   findings: [],
   next_steps: ["Retain the current test coverage."]
 };
+const requestedSchema = capture.jsonSchema ? JSON.parse(capture.jsonSchema) : null;
+const defaultStructuredOutput = requestedSchema?.properties?.decision
+  ? { decision: "allow", reason: "No blocking issue was introduced in the previous turn." }
+  : defaultReview;
 if (process.env.FAKE_GROK_FAIL_BEFORE_SESSION !== "1") {
   const output = process.env.FAKE_GROK_OUTPUT || "FAKE_GROK_OK";
   if (capture.outputFormat === "streaming-json") {
@@ -78,7 +82,7 @@ if (process.env.FAKE_GROK_FAIL_BEFORE_SESSION !== "1") {
   } else {
     process.stdout.write(process.env.FAKE_GROK_OUTPUT != null
       ? `${process.env.FAKE_GROK_OUTPUT}\n`
-      : (jsonSchemaIndex === -1 ? `${output}\n` : `${JSON.stringify(defaultReview)}\n`));
+      : (jsonSchemaIndex === -1 ? `${output}\n` : `${JSON.stringify(defaultStructuredOutput)}\n`));
   }
   process.exitCode = Number(process.env.FAKE_GROK_EXIT_CODE || 0);
 }

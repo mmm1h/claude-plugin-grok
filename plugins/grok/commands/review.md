@@ -14,7 +14,9 @@ Core constraint:
 - This command is review-only.
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
 - Return the companion's rendered review output verbatim to the user.
-- The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call if diff context was truncated.
+- The companion requests `--json-schema` output, runs Grok with `--sandbox read-only`, validates the returned shape, and fails closed before the model call only if evidence was truly truncated.
+- Reviews of at most 2 changed files and at most 256 KiB of tracked diff are sent inline. Larger reviews use self-collect mode: Grok receives status, changed paths, diff stat, and explicit instructions to inspect relevant files with its existing read-only tools. General shell access is never enabled.
+- Branch self-collection fails closed when the working tree is dirty, because direct file reads would not faithfully represent the selected commit range.
 
 Execution mode:
 - If the arguments include `--wait`, run in the foreground without asking.

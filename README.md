@@ -52,7 +52,7 @@ Runs a read-only review of the current working tree, or of a branch against a ba
 /grok:review --scope branch
 ```
 
-The companion collects git status and diff context itself. Grok receives only the `read_file`, `grep`, and `list_dir` tools in `plan` permission mode, with shell, edit, subagent, and web tools unavailable.
+The companion selects the evidence mode before invoking Grok. Changes of at most 2 files and 256 KiB of tracked diff are included inline. Larger changes use `self-collect`: the prompt contains git status, changed paths, diff stat, and instructions to inspect relevant files itself. Grok still receives only the `read_file`, `grep`, and `list_dir` tools in `plan` permission mode, with shell, edit, subagent, and web tools unavailable. Self-collection is not truncation; genuinely incomplete evidence still fails closed before the model call. Branch self-collection also fails closed when a dirty working tree would make direct file reads disagree with the selected commit range.
 
 ### `/grok:adversarial-review`
 
@@ -98,7 +98,10 @@ Transfer is intentionally **not** a native session import. Grok receives a lossy
 
 ### `/grok:status`
 
-Shows active and recent jobs for the repository.
+Shows Running, Latest finished, and Recent job sections for the repository. JSON output keeps the backward-compatible flat `jobs` array and also exposes `running`, `latestFinished`, and `recent`.
+`--wait` requires an explicit job ID. JSON wait responses include the resolved
+`waitedJobId`, boolean `waitTimedOut`, and effective `timeoutMs`; timing out
+returns the latest job snapshot so it can still be inspected or cancelled.
 
 ```text
 /grok:status
@@ -135,7 +138,7 @@ Checks Node, `grok --version`, local authentication evidence, and review-gate co
 /grok:setup --disable-review-gate
 ```
 
-The optional Stop hook runs a read-only Grok check before Claude ends a turn. It can create long Claude/Grok loops and consume usage quickly, so it is disabled by default.
+The optional Stop hook reviews only files directly edited in Claude's immediately previous turn. Turns with no file edits or no attributable diff are allowed immediately, and older working-tree findings are out of scope. The gate uses schema-constrained `{ decision, reason }` output in Grok's read-only sandbox; malformed output fails closed with guidance to run `/grok:review --wait` manually. It can create long Claude/Grok loops and consume usage quickly, so it remains disabled by default and is enabled only with `/grok:setup --enable-review-gate`.
 
 ## Runtime Differences
 
@@ -145,7 +148,7 @@ This repository follows the user-facing shape of `openai/codex-plugin-cc`, but t
 | --- | --- | --- |
 | Local engine | Codex CLI plus app-server | Grok headless CLI |
 | Protocol | app-server JSON-RPC and broker | direct cross-platform process spawn |
-| Review | Codex app-server review mode | `--json-schema` plus `--sandbox read-only`, strict shape validation, and fail-closed handling for truncated diffs |
+| Review | Codex app-server review mode | `--json-schema` plus `--sandbox read-only`; small diffs inline, large diffs self-collect through `read_file,grep,list_dir`, and true truncation fails closed |
 | Write task | Codex sandbox/config integration | `--always-approve --permission-mode bypassPermissions` |
 | Read-only task | Codex read-only sandbox | `plan` plus `read_file,grep,list_dir` allowlist |
 | Session ID | app-server thread ID | plugin-created UUID passed through `--session-id` |
@@ -162,8 +165,9 @@ No Codex app-server, broker, JSON-RPC protocol, generated app-server types, `cod
   cancellation are implemented around the headless CLI process.
 - Transfer cannot import Claude's native session graph. It creates a new Grok
   session from a bounded, lossy handoff envelope.
-- Large diffs still fail closed when companion-collected context is truncated;
-  read-only self-collection by Grok is not implemented.
+- Grok cannot run read-only git shell commands in review mode. Large-diff
+  self-collection therefore uses status/stat evidence plus direct file reads;
+  deleted-file claims remain limited to evidence the prompt can safely expose.
 
 ## State and Privacy
 

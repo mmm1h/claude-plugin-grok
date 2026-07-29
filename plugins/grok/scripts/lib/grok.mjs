@@ -543,7 +543,8 @@ export function findLatestTaskSession(cwd, options = {}) {
       status: fromJobs.status,
       summary: fromJobs.summary,
       updatedAt: fromJobs.updatedAt,
-      sessionConfirmed: true
+      sessionConfirmed: true,
+      resumable: true
     };
   }
   return null;

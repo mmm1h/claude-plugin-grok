@@ -25,13 +25,11 @@ function filterCurrentSession(jobs, options = {}) {
   return sessionId && !options.all ? jobs.filter((job) => job.claudeSessionId === sessionId) : jobs;
 }
 
-function duration(startValue, endValue = null) {
-  const start = Date.parse(startValue ?? "");
-  const end = endValue ? Date.parse(endValue) : Date.now();
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+function formatDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) {
     return null;
   }
-  const seconds = Math.max(0, Math.round((end - start) / 1000));
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
   if (seconds >= 3600) {
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
   }
@@ -39,6 +37,14 @@ function duration(startValue, endValue = null) {
     return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   }
   return `${seconds}s`;
+}
+
+function duration(startValue, endValue = null) {
+  const start = Date.parse(startValue ?? "");
+  const end = endValue ? Date.parse(endValue) : Date.now();
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start
+    ? formatDuration(end - start)
+    : null;
 }
 
 function progressPreview(logPath, maxLines = 4) {
@@ -58,8 +64,10 @@ export function enrichJob(job, options = {}) {
   return {
     ...job,
     phase: job.phase ?? job.status ?? "unknown",
-    elapsed: duration(job.startedAt ?? job.createdAt, job.completedAt),
-    duration: active ? null : duration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt),
+    elapsed: active ? duration(job.startedAt ?? job.createdAt) : null,
+    duration: active
+      ? null
+      : (formatDuration(job.durationMs) ?? duration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)),
     progressPreview: active || job.status === "failed" ? progressPreview(job.logPath, options.maxProgressLines) : []
   };
 }
@@ -187,10 +195,22 @@ export function readStoredJob(workspaceRoot, jobId) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(filterCurrentSession(reconciledJobs(workspaceRoot, options), options));
+  const selected = options.all ? jobs : jobs.slice(0, options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS);
+  const running = jobs
+    .filter((job) => ["queued", "running"].includes(job.status))
+    .map(enrichJob);
+  const latestFinishedRaw = jobs.find((job) => !["queued", "running"].includes(job.status)) ?? null;
+  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw) : null;
+  const recent = selected
+    .filter((job) => !["queued", "running"].includes(job.status) && job.id !== latestFinished?.id)
+    .map(enrichJob);
   return {
     workspaceRoot,
     reviewGateEnabled: Boolean(getConfig(workspaceRoot).stopReviewGate),
-    jobs: (options.all ? jobs : jobs.slice(0, options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS)).map(enrichJob)
+    jobs: selected.map(enrichJob),
+    running,
+    latestFinished,
+    recent
   };
 }
 

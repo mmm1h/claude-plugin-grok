@@ -62,12 +62,16 @@ import {
   indexJobRecord,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
+import { validateStopReviewResult } from "./lib/stop-review.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const REVIEW_SCHEMA = JSON.parse(
   fs.readFileSync(path.resolve(SCRIPT_DIR, "../schemas/review-output.schema.json"), "utf8")
+);
+const STOP_REVIEW_SCHEMA = JSON.parse(
+  fs.readFileSync(path.resolve(SCRIPT_DIR, "../schemas/stop-review-output.schema.json"), "utf8")
 );
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240_000;
@@ -230,6 +234,7 @@ function buildReviewRequest(cwd, options, focus, adversarial) {
       TARGET_LABEL: target.label,
       USER_FOCUS: focus || "(none)",
       CHANGE_SUMMARY: context.summary,
+      COLLECTION_GUIDANCE: context.collectionGuidance,
       REPOSITORY_CONTEXT: context.content
     }
   );
@@ -243,15 +248,16 @@ function buildReviewRequest(cwd, options, focus, adversarial) {
       summary: context.summary,
       fileCount: context.fileCount,
       diffBytes: context.diffBytes,
-      truncated: context.truncated,
-      inputMode: context.inputMode
+      truncated: context.truncated === true,
+      inputMode: context.inputMode,
+      collectionGuidance: context.collectionGuidance
     },
     model: options.model ?? null
   };
 }
 
 async function executeReview(request, onProgress) {
-  if (request.context.truncated) {
+  if (request.context.truncated === true) {
     const parseError = "Review context was truncated; refusing to invoke Grok on an incomplete diff. Narrow the review with --base or --scope.";
     const payload = {
       exitCode: 1,
@@ -289,16 +295,20 @@ async function executeReview(request, onProgress) {
   const payload = {
     exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     result: parsed.ok ? parsed.data : null,
     rawOutput: result.stdout.trimEnd(),
     parseError,
     stderr: result.stderr.trimEnd(),
+    signal: result.signal,
+    durationMs: result.durationMs,
     target: request.target,
     context: request.context
   };
   return {
     exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     payload,
     rendered: renderReviewResult(payload),
     errorMessage: exitCode === 0
@@ -344,6 +354,50 @@ async function executeTask(request, onProgress, onTelemetry) {
   };
 }
 
+async function executeStopReview(request, onProgress) {
+  const result = await runGrokHeadless({
+    cwd: request.cwd,
+    prompt: request.prompt,
+    model: request.model,
+    effort: request.effort,
+    write: false,
+    sandbox: "read-only",
+    jsonSchema: STOP_REVIEW_SCHEMA,
+    onProgress,
+    timeoutMs: request.timeoutMs
+  });
+  const parsed = parseGrokStructuredOutput(result.stdout);
+  const validationError = parsed.ok ? validateStopReviewResult(parsed.data) : null;
+  const parseError = parsed.ok
+    ? (validationError ? `Structured stop-review validation failed: ${validationError}` : null)
+    : parsed.parseError;
+  const exitCode = result.exitCode === 0 && parseError ? 1 : result.exitCode;
+  const payload = {
+    exitCode,
+    grokExitCode: result.exitCode,
+    sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
+    result: parsed.ok ? parsed.data : null,
+    rawOutput: result.stdout.trimEnd(),
+    parseError,
+    stderr: result.stderr.trimEnd(),
+    signal: result.signal,
+    durationMs: result.durationMs,
+    write: false,
+    resumed: false
+  };
+  return {
+    exitCode,
+    sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
+    payload,
+    rendered: renderTaskResult(payload, { title: request.title }),
+    errorMessage: exitCode === 0
+      ? null
+      : (parseError || result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
+  };
+}
+
 async function executeTransfer(request, onProgress) {
   const result = await runGrokHeadless({
     cwd: request.cwd,
@@ -354,14 +408,18 @@ async function executeTransfer(request, onProgress) {
   const payload = {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     rawOutput: result.stdout.trimEnd(),
     stderr: result.stderr.trimEnd(),
+    signal: result.signal,
+    durationMs: result.durationMs,
     sourcePath: request.sourcePath,
     ...request.handoffMetadata
   };
   return {
     exitCode: result.exitCode,
     sessionId: result.sessionId,
+    sessionConfirmed: result.sessionConfirmed,
     payload,
     rendered: result.exitCode === 0 ? renderTransferResult(payload) : renderTaskResult(payload, { title: "Grok Transfer" }),
     errorMessage: result.exitCode === 0 ? null : (result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
@@ -374,6 +432,9 @@ function executeRequest(request, onProgress, onTelemetry) {
   }
   if (request.type === "task") {
     return executeTask(request, onProgress, onTelemetry);
+  }
+  if (request.type === "stop-review") {
+    return executeStopReview(request, onProgress);
   }
   if (request.type === "transfer") {
     return executeTransfer(request, onProgress);
@@ -486,6 +547,9 @@ async function handleTask(argv) {
   if (options.write && options["read-only"]) {
     throw new Error("Choose either --write or --read-only.");
   }
+  if (options["stop-review"] && options.write) {
+    throw new Error("Stop reviews are always read-only; do not pass --write.");
+  }
   if ((options["resume-last"] || options.resume) && options.fresh) {
     throw new Error("Choose either --resume-last/--resume or --fresh.");
   }
@@ -499,16 +563,17 @@ async function handleTask(argv) {
   if ((options["resume-last"] || options.resume) && !resume) {
     throw new Error("No resumable Grok task session was found for the current Claude session and workspace.");
   }
-  const write = options["read-only"] ? false : true;
+  const stopReview = Boolean(options["stop-review"]);
+  const write = stopReview ? false : !options["read-only"];
   const timeoutMs = options["timeout-ms"] == null ? null : Number(options["timeout-ms"]);
   if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
     throw new Error("--timeout-ms must be a positive number.");
   }
-  const kind = options["stop-review"] ? "stop-review" : "task";
-  const title = options["stop-review"] ? "Grok Stop Review" : (resume ? "Grok Resumed Task" : "Grok Task");
+  const kind = stopReview ? "stop-review" : "task";
+  const title = stopReview ? "Grok Stop Review" : (resume ? "Grok Resumed Task" : "Grok Task");
   const sessionId = resume?.sessionId ?? randomUUID();
   const request = {
-    type: "task",
+    type: stopReview ? "stop-review" : "task",
     cwd: resolveWorkspaceRoot(cwd),
     prompt,
     write,
@@ -555,7 +620,8 @@ function handleTaskResumeCandidate(argv) {
     status: candidate?.status ?? null,
     summary: candidate?.summary ?? null,
     updatedAt: candidate?.updatedAt ?? null,
-    sessionConfirmed: Boolean(candidate?.sessionConfirmed)
+    sessionConfirmed: Boolean(candidate?.sessionConfirmed),
+    resumable: Boolean(candidate?.resumable)
   };
   output(payload, payload.available
     ? `Resumable Grok session: ${payload.sessionId}\n`
@@ -592,17 +658,19 @@ async function handleTransfer(argv) {
 }
 
 async function waitForJob(cwd, reference, timeoutMs) {
-  const started = Date.now();
-  for (;;) {
-    const snapshot = buildSingleJobSnapshot(cwd, reference);
-    if (!["queued", "running"].includes(snapshot.job.status)) {
-      return snapshot;
-    }
-    if (Date.now() - started >= timeoutMs) {
-      return snapshot;
-    }
-    await new Promise((resolve) => setTimeout(resolve, STATUS_POLL_INTERVAL_MS));
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  while (["queued", "running"].includes(snapshot.job.status) && Date.now() < deadline) {
+    const remainingMs = Math.max(0, deadline - Date.now());
+    await new Promise((resolve) => setTimeout(resolve, Math.min(STATUS_POLL_INTERVAL_MS, remainingMs)));
+    snapshot = buildSingleJobSnapshot(cwd, reference);
   }
+  return {
+    ...snapshot,
+    waitedJobId: snapshot.job.id,
+    waitTimedOut: ["queued", "running"].includes(snapshot.job.status),
+    timeoutMs
+  };
 }
 
 async function handleStatus(argv) {
@@ -616,18 +684,15 @@ async function handleStatus(argv) {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new Error("--timeout-ms must be a non-negative number.");
   }
+  if (options.wait && !reference) {
+    throw new Error("`status --wait` requires a job id.");
+  }
   if (reference) {
     const snapshot = options.wait
       ? await waitForJob(cwd, reference, timeoutMs)
       : buildSingleJobSnapshot(cwd, reference);
     output(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
-  }
-  if (options.wait) {
-    const active = buildStatusSnapshot(cwd, { all: options.all }).jobs.find((job) => ["queued", "running"].includes(job.status));
-    if (active) {
-      await waitForJob(cwd, active.id, timeoutMs);
-    }
   }
   const snapshot = buildStatusSnapshot(cwd, { all: options.all });
   output(snapshot, renderStatusReport(snapshot), options.json);

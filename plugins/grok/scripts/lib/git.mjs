@@ -4,7 +4,9 @@ import path from "node:path";
 import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
-const DEFAULT_MAX_DIFF_BYTES = 512 * 1024;
+const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
+const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
+const DEFAULT_SELF_COLLECT_MAX_BYTES = 512 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 32 * 1024;
 
 function git(cwd, args, options = {}) {
@@ -21,6 +23,11 @@ function lines(value) {
 
 function uniqueFiles(...groups) {
   return [...new Set(groups.flat().filter(Boolean))].sort();
+}
+
+function normalizeLimit(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 }
 
 function formatSection(title, body) {
@@ -59,6 +66,35 @@ function readDiff(cwd, args, maxBytes) {
     ...truncateUtf8(result.stdout, maxBytes),
     measuredBytes: Buffer.byteLength(result.stdout, "utf8")
   };
+}
+
+function measureGitOutputBytes(cwd, args, maxBytes) {
+  const result = git(cwd, args, { maxBuffer: maxBytes + 1 });
+  if (result.error?.code === "ENOBUFS") {
+    return maxBytes + 1;
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(formatCommandFailure(result));
+  }
+  return Buffer.byteLength(result.stdout, "utf8");
+}
+
+function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
+  let total = 0;
+  for (const args of argSets) {
+    const remaining = maxBytes - total;
+    if (remaining < 0) {
+      return maxBytes + 1;
+    }
+    total += measureGitOutputBytes(cwd, args, remaining);
+    if (total > maxBytes) {
+      return total;
+    }
+  }
+  return total;
 }
 
 export function ensureGitRepository(cwd) {
@@ -168,80 +204,118 @@ function buildBranchComparison(cwd, baseRef) {
   };
 }
 
-function collectWorkingTreeContext(repoRoot, maxDiffBytes) {
-  const state = getWorkingTreeState(repoRoot);
+function selfCollectionGuidance() {
+  return [
+    "The complete diff is intentionally not inline because this review exceeds the inline evidence threshold.",
+    "Treat the changed-files list as the review scope and use only the available read-only tools (read_file, grep, and list_dir) to inspect every relevant changed file and its surrounding code before deciding.",
+    "Do not infer the contents of unread files or treat this summary as a complete patch. Deleted paths cannot be read, so make claims only when the status/stat and readable repository evidence support them."
+  ].join(" ");
+}
+
+function inlineCollectionGuidance() {
+  return "The complete tracked diff is inline below. Use it as primary evidence and use the available read-only tools for surrounding repository context when needed.";
+}
+
+function collectWorkingTreeContext(repoRoot, state, options = {}) {
+  const includeDiff = options.includeDiff !== false;
+  const maxDiffBytes = options.maxDiffBytes;
   const changedFiles = uniqueFiles(state.staged, state.unstaged, state.untracked);
+  const status = gitChecked(repoRoot, ["status", "--short", "--untracked-files=all"]).stdout;
+
+  if (!includeDiff) {
+    return {
+      mode: "working-tree",
+      summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
+      changedFiles,
+      truncated: false,
+      collectionGuidance: selfCollectionGuidance(),
+      content: [
+        formatSection("Collection Guidance", selfCollectionGuidance()),
+        formatSection("Git Status", status),
+        formatSection("Changed Files", changedFiles.join("\n")),
+        formatSection("Staged Diff Stat", gitChecked(repoRoot, ["diff", "--stat", "--cached"]).stdout),
+        formatSection("Unstaged Diff Stat", gitChecked(repoRoot, ["diff", "--stat"]).stdout)
+      ].join("\n")
+    };
+  }
+
   const staged = readDiff(
     repoRoot,
     ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
-    Math.floor(maxDiffBytes / 2)
+    maxDiffBytes
   );
-  const remaining = Math.max(4096, maxDiffBytes - Buffer.byteLength(staged.text, "utf8"));
+  const remaining = Math.max(0, maxDiffBytes - Buffer.byteLength(staged.text, "utf8"));
   const unstaged = readDiff(
     repoRoot,
     ["diff", "--binary", "--no-ext-diff", "--submodule=diff"],
     remaining
   );
-  const untrackedBudget = Math.max(
-    4096,
-    maxDiffBytes - Buffer.byteLength(staged.text, "utf8") - Buffer.byteLength(unstaged.text, "utf8")
-  );
-  const untracked = truncateUtf8(
-    state.untracked.map((file) => formatUntrackedFile(repoRoot, file)).join("\n\n"),
-    untrackedBudget
-  );
-  const changedFileList = truncateUtf8(changedFiles.join("\n"), 64 * 1024);
-  const truncated = staged.truncated || unstaged.truncated || untracked.truncated || changedFileList.truncated;
-  const limitation = truncated
-    ? "The inline diff exceeded the companion limit. Review the included patch and read current changed files; deleted or omitted hunks may require a follow-up review with a narrower scope."
-    : "The complete tracked diff is included below.";
+  const untrackedBody = state.untracked.map((file) => formatUntrackedFile(repoRoot, file)).join("\n\n");
+  const truncated = staged.truncated || unstaged.truncated;
+  const guidance = truncated
+    ? "The requested inline diff was truly truncated while collecting evidence. Do not approve this review."
+    : inlineCollectionGuidance();
 
   return {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
     changedFiles,
     truncated,
-    diffBytes: staged.measuredBytes + unstaged.measuredBytes,
+    collectionGuidance: guidance,
     content: [
-      formatSection("Collection Note", limitation),
-      formatSection("Git Status", gitChecked(repoRoot, ["status", "--short", "--untracked-files=all"]).stdout),
-      formatSection("Changed Files", changedFileList.text),
+      formatSection("Collection Guidance", guidance),
+      formatSection("Git Status", status),
+      formatSection("Changed Files", changedFiles.join("\n")),
       formatSection("Staged Diff", staged.text),
       formatSection("Unstaged Diff", unstaged.text),
-      formatSection("Untracked Files", untracked.text)
+      formatSection("Untracked Files", untrackedBody)
     ].join("\n")
   };
 }
 
-function collectBranchContext(repoRoot, baseRef, maxDiffBytes) {
-  const comparison = buildBranchComparison(repoRoot, baseRef);
+function collectBranchContext(repoRoot, baseRef, comparison, options = {}) {
+  const includeDiff = options.includeDiff !== false;
   const changedFiles = lines(gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout);
+  const commitLog = gitChecked(repoRoot, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout;
+  const diffStat = gitChecked(repoRoot, ["diff", "--stat", comparison.commitRange]).stdout;
+
+  if (!includeDiff) {
+    return {
+      mode: "branch",
+      summary: `Reviewing branch ${getCurrentBranch(repoRoot)} against ${baseRef} from merge-base ${comparison.mergeBase}.`,
+      changedFiles,
+      comparison,
+      truncated: false,
+      collectionGuidance: selfCollectionGuidance(),
+      content: [
+        formatSection("Collection Guidance", selfCollectionGuidance()),
+        formatSection("Commit Log", commitLog),
+        formatSection("Diff Stat", diffStat),
+        formatSection("Changed Files", changedFiles.join("\n"))
+      ].join("\n")
+    };
+  }
+
   const diff = readDiff(
     repoRoot,
     ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
-    maxDiffBytes
+    options.maxDiffBytes
   );
-  const changedFileList = truncateUtf8(changedFiles.join("\n"), 64 * 1024);
-  const commitLog = truncateUtf8(
-    gitChecked(repoRoot, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout,
-    64 * 1024
-  );
-  const truncated = diff.truncated || changedFileList.truncated || commitLog.truncated;
-  const limitation = truncated
-    ? "The inline branch context exceeded the companion limit. Review the included patch and read current changed files; deleted or omitted hunks may require a narrower follow-up review."
-    : "The complete branch diff is included below.";
+  const guidance = diff.truncated
+    ? "The requested inline diff was truly truncated while collecting evidence. Do not approve this review."
+    : inlineCollectionGuidance();
   return {
     mode: "branch",
     summary: `Reviewing branch ${getCurrentBranch(repoRoot)} against ${baseRef} from merge-base ${comparison.mergeBase}.`,
     changedFiles,
     comparison,
-    truncated,
-    diffBytes: diff.measuredBytes,
+    truncated: diff.truncated,
+    collectionGuidance: guidance,
     content: [
-      formatSection("Collection Note", limitation),
-      formatSection("Commit Log", commitLog.text),
-      formatSection("Diff Stat", gitChecked(repoRoot, ["diff", "--stat", comparison.commitRange]).stdout),
-      formatSection("Changed Files", changedFileList.text),
+      formatSection("Collection Guidance", guidance),
+      formatSection("Commit Log", commitLog),
+      formatSection("Diff Stat", diffStat),
+      formatSection("Changed Files", changedFiles.join("\n")),
       formatSection("Branch Diff", diff.text)
     ].join("\n")
   };
@@ -249,19 +323,70 @@ function collectBranchContext(repoRoot, baseRef, maxDiffBytes) {
 
 export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
-  const maxDiffBytes = Number.isFinite(Number(options.maxDiffBytes))
-    ? Math.max(8192, Number(options.maxDiffBytes))
-    : DEFAULT_MAX_DIFF_BYTES;
-  const details = target.mode === "working-tree"
-    ? collectWorkingTreeContext(repoRoot, maxDiffBytes)
-    : collectBranchContext(repoRoot, target.baseRef, maxDiffBytes);
+  const maxInlineFiles = normalizeLimit(options.maxInlineFiles, DEFAULT_INLINE_DIFF_MAX_FILES);
+  const maxInlineDiffBytes = normalizeLimit(options.maxInlineDiffBytes, DEFAULT_INLINE_DIFF_MAX_BYTES);
+  const maxDiffBytes = normalizeLimit(options.maxDiffBytes, maxInlineDiffBytes);
+  const maxSelfCollectBytes = normalizeLimit(options.maxSelfCollectBytes, DEFAULT_SELF_COLLECT_MAX_BYTES);
+  let details;
+  let diffBytes;
+  let includeDiff;
+
+  if (target.mode === "working-tree") {
+    const state = getWorkingTreeState(repoRoot);
+    const changedFiles = uniqueFiles(state.staged, state.unstaged, state.untracked);
+    diffBytes = measureCombinedGitOutputBytes(
+      repoRoot,
+      [
+        ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"],
+        ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]
+      ],
+      maxInlineDiffBytes
+    );
+    includeDiff = options.includeDiff ?? (
+      changedFiles.length <= maxInlineFiles && diffBytes <= maxInlineDiffBytes
+    );
+    details = collectWorkingTreeContext(repoRoot, state, { includeDiff, maxDiffBytes });
+  } else {
+    const comparison = buildBranchComparison(repoRoot, target.baseRef);
+    const changedFiles = lines(gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout);
+    diffBytes = measureGitOutputBytes(
+      repoRoot,
+      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
+      maxInlineDiffBytes
+    );
+    includeDiff = options.includeDiff ?? (
+      changedFiles.length <= maxInlineFiles && diffBytes <= maxInlineDiffBytes
+    );
+    details = collectBranchContext(repoRoot, target.baseRef, comparison, { includeDiff, maxDiffBytes });
+    if (!includeDiff && getWorkingTreeState(repoRoot).isDirty) {
+      const failure = "Branch self-collection cannot verify the selected commit range while the working tree is dirty because read-only file tools would observe uncommitted content.";
+      details = {
+        ...details,
+        truncated: true,
+        collectionGuidance: `${failure} Do not approve this review.`,
+        content: formatSection("Collection Failure", failure)
+      };
+    }
+  }
+
+  if (!includeDiff && Buffer.byteLength(details.content, "utf8") > maxSelfCollectBytes) {
+    const failure = `Self-collection summary exceeded the ${maxSelfCollectBytes} byte evidence limit. Refusing to provide a partial file list or diff stat.`;
+    details = {
+      ...details,
+      truncated: true,
+      collectionGuidance: `${failure} Do not approve this review.`,
+      content: formatSection("Collection Failure", failure)
+    };
+  }
+
   return {
     cwd: repoRoot,
     repoRoot,
     branch: getCurrentBranch(repoRoot),
     target,
     fileCount: details.changedFiles.length,
-    inputMode: details.truncated ? "truncated-diff" : "inline-diff",
+    diffBytes,
+    inputMode: details.truncated ? "truncated-diff" : (includeDiff ? "inline-diff" : "self-collect"),
     ...details
   };
 }

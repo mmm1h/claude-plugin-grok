@@ -10,6 +10,7 @@ Change summary: {{CHANGE_SUMMARY}}
 
 <grounding_rules>
 - Ground every finding in the supplied diff or files you can read with the available read-only tools.
+- Follow the collection guidance below. In self-collect mode, inspect the listed changed files yourself with read_file, grep, and list_dir; do not approve or report findings based on paths you did not inspect.
 - Do not edit files, run commands, or claim evidence you did not observe.
 - Prioritize correctness, security, data loss, concurrency, compatibility, and user-visible regressions.
 - Do not report style preferences or speculative concerns without a concrete failure mode.
@@ -17,6 +18,10 @@ Change summary: {{CHANGE_SUMMARY}}
 - If no actionable defects are found, return an empty findings array and verdict `approve`.
 - If any finding is present, use verdict `needs-attention`.
 </grounding_rules>
+
+<collection_guidance>
+{{COLLECTION_GUIDANCE}}
+</collection_guidance>
 
 <output_contract>
 Return only JSON that conforms to the supplied review output schema.

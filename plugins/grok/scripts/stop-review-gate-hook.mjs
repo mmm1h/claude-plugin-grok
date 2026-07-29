@@ -10,6 +10,7 @@ import { getGrokAvailability } from "./lib/grok.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
+import { parseStopReviewDecision } from "./lib/stop-review.mjs";
 import { CLAUDE_SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -33,21 +34,27 @@ function currentSessionJobs(workspaceRoot, input) {
 }
 
 function parseDecision(rawOutput) {
-  const text = String(rawOutput ?? "").trim();
-  const first = text.split(/\r?\n/, 1)[0] ?? "";
-  if (first.startsWith("ALLOW:")) {
-    return { allow: true, reason: null };
+  return parseStopReviewDecision(rawOutput?.result, rawOutput?.rawOutput);
+}
+
+function hasWorkingTreeChanges(cwd) {
+  const result = spawnSync("git", ["status", "--porcelain=v1", "--untracked-files=normal"], {
+    cwd,
+    encoding: "utf8",
+    timeout: 5_000,
+    windowsHide: true
+  });
+  if (result.error || result.status !== 0) {
+    return null;
   }
-  if (first.startsWith("BLOCK:")) {
-    return {
-      allow: false,
-      reason: first.slice("BLOCK:".length).trim() || text
-    };
+  return Boolean(String(result.stdout).trim());
+}
+
+function canSkipReview(cwd, input) {
+  if (String(input.last_assistant_message ?? "").trim()) {
+    return false;
   }
-  return {
-    allow: false,
-    reason: "The Grok stop review returned an unexpected answer. Run /grok:review --wait manually or disable the gate."
-  };
+  return hasWorkingTreeChanges(cwd) === false;
 }
 
 function runReview(cwd, input) {
@@ -78,17 +85,35 @@ function runReview(cwd, input) {
     }
   );
   if (result.error?.code === "ETIMEDOUT") {
-    return { allow: false, reason: "The Grok stop review timed out after 15 minutes." };
+    return {
+      allow: false,
+      reason: "The Grok stop review timed out after 15 minutes. Run /grok:review --wait manually or disable the gate."
+    };
+  }
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch {
+    // The failure path below reports malformed companion output.
   }
   if (result.error || result.status !== 0) {
+    const legacy = payload ? parseDecision(payload) : null;
+    if (payload?.grokExitCode === 0 && legacy?.source === "legacy") {
+      return legacy;
+    }
     const detail = String(result.stderr || result.stdout || result.error?.message || "").trim();
-    return { allow: false, reason: `The Grok stop review failed${detail ? `: ${detail}` : "."}` };
+    return {
+      allow: false,
+      reason: `The Grok stop review failed${detail ? `: ${detail}` : "."} Run /grok:review --wait manually or disable the gate.`
+    };
   }
-  try {
-    return parseDecision(JSON.parse(result.stdout)?.rawOutput);
-  } catch {
-    return { allow: false, reason: "The Grok stop review returned invalid JSON." };
+  if (!payload) {
+    return {
+      allow: false,
+      reason: "The Grok stop review returned invalid JSON. Run /grok:review --wait manually or disable the gate."
+    };
   }
+  return parseDecision(payload);
 }
 
 function main() {
@@ -102,6 +127,12 @@ function main() {
     : null;
 
   if (!getConfig(workspaceRoot).stopReviewGate) {
+    if (activeNote) {
+      process.stderr.write(`${activeNote}\n`);
+    }
+    return;
+  }
+  if (canSkipReview(cwd, input)) {
     if (activeNote) {
       process.stderr.write(`${activeNote}\n`);
     }

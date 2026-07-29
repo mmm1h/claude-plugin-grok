@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Grok stop-review output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "reason"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "block"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

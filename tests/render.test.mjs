@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
@@ -27,21 +28,83 @@ test("setup renderer includes readiness, auth, gate, and next steps", () => {
   assert.match(rendered, /Run `grok login`/);
 });
 
-test("status renderer is a compact actionable Markdown table", () => {
+test("status renderer groups running, latest finished, and recent jobs", () => {
+  const running = {
+    id: "task-123",
+    kind: "task",
+    status: "running",
+    phase: "running",
+    elapsed: "3s",
+    lastProgressAt: "2026-07-29T08:00:00.000Z",
+    sessionId: "44444444-4444-4444-8444-444444444444",
+    sessionConfirmed: true,
+    resumable: false,
+    summary: "Fix | verify"
+  };
   const rendered = renderStatusReport({
-    jobs: [{
-      id: "task-123",
-      kind: "task",
-      status: "running",
-      phase: "running",
-      elapsed: "3s",
-      sessionId: null,
-      summary: "Fix | verify"
+    reviewGateEnabled: false,
+    running: [running],
+    latestFinished: {
+      ...running,
+      id: "review-456",
+      kind: "review",
+      status: "completed",
+      phase: "completed",
+      elapsed: null,
+      duration: "5s",
+      summary: "Latest review"
+    },
+    recent: [{
+      ...running,
+      id: "task-789",
+      status: "failed",
+      phase: "failed",
+      elapsed: null,
+      duration: "8s",
+      summary: "Older task"
     }]
   });
-  assert.match(rendered, /^\| Job \| Kind \|/);
+  assert.match(rendered, /^# Grok Status/);
+  assert.match(rendered, /## Running/);
+  assert.match(rendered, /## Latest finished/);
+  assert.match(rendered, /## Recent/);
   assert.match(rendered, /Fix \\?\| verify/);
+  assert.match(rendered, /elapsed 3s/);
+  assert.match(rendered, /duration 5s/);
+  assert.match(rendered, /Older task/);
+  assert.match(rendered, /2026-07-29T08:00:00.000Z/);
+  assert.match(rendered, /\| yes \| no \|/);
   assert.match(rendered, /\/grok:cancel task-123/);
+});
+
+test("single-job status renderer includes lifecycle and cancellation evidence", () => {
+  const rendered = renderJobStatusReport({
+    id: "task-123",
+    kind: "task",
+    status: "cancelled",
+    phase: "cancelled",
+    summary: "Stopped task",
+    duration: "4s",
+    pid: null,
+    sessionId: "44444444-4444-4444-8444-444444444444",
+    sessionConfirmed: true,
+    resumable: true,
+    lastProgressAt: "2026-07-29T08:00:00.000Z",
+    exitCode: 130,
+    terminationMethod: "taskkill",
+    terminationDelivered: true,
+    cancelRequestedAt: "2026-07-29T08:00:01.000Z",
+    cancelledAt: "2026-07-29T08:00:02.000Z",
+    logPath: "C:\\state\\task-123.log"
+  });
+  assert.match(rendered, /Duration: 4s/);
+  assert.match(rendered, /Last progress: 2026-07-29T08:00:00.000Z/);
+  assert.match(rendered, /Session confirmed: yes/);
+  assert.match(rendered, /Resumable: yes/);
+  assert.match(rendered, /Exit code: 130/);
+  assert.match(rendered, /Termination delivered: yes/);
+  assert.match(rendered, /Cancellation requested:/);
+  assert.match(rendered, /Cancelled:/);
 });
 
 test("task and stored-result renderers preserve session and raw output", () => {
@@ -60,9 +123,17 @@ test("task and stored-result renderers preserve session and raw output", () => {
     sessionId: payload.sessionId,
     sessionConfirmed: true,
     resumable: true,
+    lastProgressAt: "2026-07-29T08:00:00.000Z",
+    durationMs: 1234,
+    exitCode: 0,
     rendered: "implementation complete\n"
   });
   assert.match(stored, /Job ID: task-123/);
+  assert.match(stored, /Duration: 1s/);
+  assert.match(stored, /Last progress: 2026-07-29T08:00:00.000Z/);
+  assert.match(stored, /Session confirmed: yes/);
+  assert.match(stored, /Resumable: yes/);
+  assert.match(stored, /Exit code: 0/);
   assert.match(stored, /implementation complete/);
 });
 
@@ -117,9 +188,11 @@ test("review renderer validates, sorts, and renders structured findings", () => 
     },
     parseError: null,
     rawOutput: "{}",
-    target: { label: "working tree diff" }
+    target: { label: "working tree diff" },
+    context: { inputMode: "self-collect" }
   });
   assert.match(rendered, /Verdict: needs-attention/);
+  assert.match(rendered, /Evidence mode: self-collect/);
   assert.ok(rendered.indexOf("Critical issue") < rendered.indexOf("Low issue"));
   assert.match(rendered, /critical\.mjs:10-12/);
   assert.match(rendered, /Confidence: 0\.99/);

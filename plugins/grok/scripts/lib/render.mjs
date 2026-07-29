@@ -13,6 +13,31 @@ function yesNo(value) {
   return value ? "yes" : "no";
 }
 
+function formatDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+    return null;
+  }
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds >= 3600) {
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  }
+  if (seconds >= 60) {
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
+  return `${seconds}s`;
+}
+
+function jobTime(job) {
+  if (job.elapsed) {
+    return `elapsed ${job.elapsed}`;
+  }
+  if (job.duration) {
+    return `duration ${job.duration}`;
+  }
+  const duration = formatDuration(job.durationMs);
+  return duration ? `duration ${duration}` : "";
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "Grok Companion setup",
@@ -162,12 +187,13 @@ export function renderReviewResult(payload) {
     `# ${reviewTitle(payload)}`,
     "",
     `Verdict: ${payload.result.verdict}`,
+    payload.context?.inputMode ? `Evidence mode: ${payload.context.inputMode}` : null,
     "",
     "Summary:",
     payload.result.summary.trim(),
     "",
     "Findings:"
-  ];
+  ].filter((value) => value !== null);
   if (!findings.length) {
     lines.push("No material findings.");
   } else {
@@ -238,36 +264,85 @@ function actionCell(job) {
 }
 
 export function renderStatusReport(snapshot) {
-  const lines = [
-    "| Job | Kind | Status | Phase | Elapsed | Grok Session ID | Summary | Actions |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |"
+  const header = [
+    "| Job | Kind | Status | Phase | Elapsed / Duration | Last Progress | Grok Session ID | Confirmed | Resumable | Summary | Actions |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   ];
-  for (const job of snapshot.jobs) {
-    lines.push(
-      `| ${markdownCell(job.id)} | ${markdownCell(job.kind)} | ${markdownCell(job.status)} | ${markdownCell(job.phase)} | ${markdownCell(job.elapsed)} | ${markdownCell(job.sessionId)} | ${markdownCell(job.summary)} | ${actionCell(job)} |`
-    );
+
+  function appendTable(lines, jobs) {
+    lines.push(...header);
+    for (const job of jobs) {
+      lines.push(
+        `| ${markdownCell(job.id)} | ${markdownCell(job.kind)} | ${markdownCell(job.status)} | ${markdownCell(job.phase)} | ${markdownCell(jobTime(job))} | ${markdownCell(job.lastProgressAt)} | ${markdownCell(job.sessionId)} | ${yesNo(job.sessionConfirmed)} | ${yesNo(job.resumable)} | ${markdownCell(job.summary)} | ${actionCell(job)} |`
+      );
+    }
   }
-  if (snapshot.jobs.length === 0) {
-    lines.push("| (none) |  |  |  |  |  | No Grok jobs for this session. |  |");
+
+  if (!("running" in snapshot) || !("latestFinished" in snapshot) || !("recent" in snapshot)) {
+    const lines = [...header];
+    for (const job of snapshot.jobs ?? []) {
+      lines.push(
+        `| ${markdownCell(job.id)} | ${markdownCell(job.kind)} | ${markdownCell(job.status)} | ${markdownCell(job.phase)} | ${markdownCell(jobTime(job))} | ${markdownCell(job.lastProgressAt)} | ${markdownCell(job.sessionId)} | ${yesNo(job.sessionConfirmed)} | ${yesNo(job.resumable)} | ${markdownCell(job.summary)} | ${actionCell(job)} |`
+      );
+    }
+    if ((snapshot.jobs ?? []).length === 0) {
+      lines.push("| (none) |  |  |  |  |  |  |  |  | No Grok jobs for this session. |  |");
+    }
+    return `${lines.join("\n")}\n`;
   }
+
+  const lines = [
+    "# Grok Status",
+    "",
+    `Review gate: ${snapshot.reviewGateEnabled ? "enabled" : "disabled"}`,
+    "",
+    "## Running",
+    ""
+  ];
+  if (snapshot.running.length) {
+    appendTable(lines, snapshot.running);
+  } else {
+    lines.push("No running jobs.");
+  }
+
+  lines.push("", "## Latest finished", "");
+  if (snapshot.latestFinished) {
+    appendTable(lines, [snapshot.latestFinished]);
+  } else {
+    lines.push("No finished jobs.");
+  }
+
+  lines.push("", "## Recent", "");
+  if (snapshot.recent.length) {
+    appendTable(lines, snapshot.recent);
+  } else {
+    lines.push("No additional recent jobs.");
+  }
+
   return `${lines.join("\n")}\n`;
 }
 
 export function renderJobStatusReport(job) {
+  const active = ["queued", "running"].includes(job.status);
   const lines = [
     `Job ID: ${job.id}`,
     `Kind: ${job.kind}`,
     `Status: ${job.status}`,
     `Phase: ${job.phase}`,
     `Summary: ${job.summary ?? ""}`,
-    `Elapsed: ${job.elapsed ?? ""}`,
+    active ? `Elapsed: ${job.elapsed ?? ""}` : `Duration: ${job.duration ?? formatDuration(job.durationMs) ?? ""}`,
     `PID: ${job.pid ?? ""}`,
     `Grok session ID: ${job.sessionId ?? ""}`,
     `Session confirmed: ${yesNo(job.sessionConfirmed)}.`,
     `Resumable: ${yesNo(job.resumable)}.`,
-    `Last progress: ${job.lastProgressAt ?? ""}`,
+    job.lastProgressAt ? `Last progress: ${job.lastProgressAt}` : null,
+    job.exitCode != null ? `Exit code: ${job.exitCode}` : null,
+    job.terminationMethod ? `Termination method: ${job.terminationMethod}` : null,
+    job.terminationDelivered != null ? `Termination delivered: ${yesNo(job.terminationDelivered)}.` : null,
+    job.cancelRequestedAt ? `Cancellation requested: ${job.cancelRequestedAt}` : null,
+    job.cancelledAt ? `Cancelled: ${job.cancelledAt}` : null,
     `Log: ${job.logPath ?? ""}`
-  ];
+  ].filter((value) => value !== null);
   if (job.progressPreview?.length) {
     lines.push("", "Recent progress:", ...job.progressPreview.map((value) => `- ${value}`));
   }
@@ -281,13 +356,20 @@ export function renderJobStatusReport(job) {
 
 export function renderStoredJobResult(storedJob) {
   const canResume = Boolean(storedJob.sessionId && storedJob.sessionConfirmed && storedJob.resumable);
+  const duration = storedJob.duration ?? formatDuration(storedJob.durationMs);
   const lines = [
     `Job ID: ${storedJob.id}`,
     `Kind: ${storedJob.kind}`,
     `Status: ${storedJob.status}`,
+    duration ? `Duration: ${duration}` : null,
+    storedJob.lastProgressAt ? `Last progress: ${storedJob.lastProgressAt}` : null,
+    `Session confirmed: ${yesNo(storedJob.sessionConfirmed)}.`,
+    `Resumable: ${yesNo(storedJob.resumable)}.`,
+    storedJob.exitCode != null ? `Exit code: ${storedJob.exitCode}` : null,
     storedJob.sessionId ? `Grok session ID: ${storedJob.sessionId}` : null,
     canResume ? `Resume in Grok: grok --resume ${storedJob.sessionId}` : null,
     storedJob.terminationMethod ? `Termination method: ${storedJob.terminationMethod}` : null,
+    storedJob.terminationDelivered != null ? `Termination delivered: ${yesNo(storedJob.terminationDelivered)}.` : null,
     storedJob.cancelRequestedAt ? `Cancellation requested: ${storedJob.cancelRequestedAt}` : null,
     storedJob.cancelledAt ? `Cancelled: ${storedJob.cancelledAt}` : null,
     ""
