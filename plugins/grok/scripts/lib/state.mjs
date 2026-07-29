@@ -344,7 +344,21 @@ function resolveJobWrite(current, payload) {
     if (payload.status !== current.status) {
       return null;
     }
-    return { ...current, ...payload, status: current.status };
+    const merged = { ...current, ...payload, status: current.status };
+    // Orphan reconciliation may mark failed/process-exited while a dying worker
+    // still finalizes the same failed status. Keep the orphan attribution.
+    if (
+      current.status === "failed"
+      && (current.phase === "process-exited" || payload.phase === "process-exited")
+    ) {
+      merged.phase = "process-exited";
+      if (current.phase === "process-exited" && current.errorMessage) {
+        merged.errorMessage = current.errorMessage;
+      } else if (payload.phase === "process-exited" && payload.errorMessage) {
+        merged.errorMessage = payload.errorMessage;
+      }
+    }
+    return merged;
   }
   return payload;
 }

@@ -454,6 +454,55 @@ test("loadState with corrupt JSON does not prune existing job files", (t) => {
   assert.ok(fs.readdirSync(path.dirname(resolveStateFile(root))).some((name) => name.includes("state.json.corrupt")));
 });
 
+test("writeJobFile keeps process-exited when a late failed worker finalizes", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-cas-orphan";
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Orphan",
+    status: "running",
+    phase: "running",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "orphan",
+    pid: 4242,
+    createdAt: new Date().toISOString()
+  });
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Orphan",
+    status: "failed",
+    phase: "process-exited",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "orphan",
+    pid: null,
+    completedAt: new Date().toISOString(),
+    errorMessage: "Tracked Grok process 4242 exited before the job reached a terminal state."
+  });
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Orphan",
+    status: "failed",
+    phase: "failed",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "orphan",
+    pid: null,
+    completedAt: new Date().toISOString(),
+    exitCode: 1,
+    errorMessage: "Grok interrupted by SIGTERM."
+  });
+  const stored = readJobFile(resolveJobFile(root, jobId));
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.phase, "process-exited");
+  assert.match(stored.errorMessage, /exited before the job reached a terminal state/);
+  assert.equal(stored.exitCode, 1);
+});
+
 test("writeJobFile rejects non-terminal overwrites of cancelled jobs", (t) => {
   const { root } = withCompanionHome(t);
   const jobId = "task-cas-terminal";

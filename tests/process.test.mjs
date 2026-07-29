@@ -19,8 +19,10 @@ import { initRepo, removeTempDir, tempDir } from "./helpers.mjs";
 
 test("POSIX termination falls back from a missing process group to the process", () => {
   const calls = [];
+  const alive = new Set([1234]);
   const result = terminateProcessTree(1234, {
     platform: "linux",
+    settleMs: 0,
     runCommandImpl: () => ({ status: 1, stdout: "", stderr: "", error: null }),
     killImpl(pid, signal) {
       calls.push([pid, signal]);
@@ -29,11 +31,28 @@ test("POSIX termination falls back from a missing process group to the process",
         error.code = "ESRCH";
         throw error;
       }
+      if (signal === 0) {
+        if (!alive.has(pid)) {
+          const error = new Error("gone");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      if (signal === "SIGKILL") {
+        alive.delete(pid);
+      }
     }
   });
-  assert.deepEqual(calls, [[-1234, "SIGTERM"], [1234, "SIGTERM"]]);
+  assert.deepEqual(calls, [
+    [-1234, "SIGTERM"],
+    [1234, "SIGTERM"],
+    [1234, 0],
+    [-1234, "SIGKILL"],
+    [1234, "SIGKILL"]
+  ]);
   assert.equal(result.delivered, true);
-  assert.equal(result.method, "process");
+  assert.equal(result.method, "process+sigkill");
 });
 
 test("termination reports an already exited process without throwing", () => {
@@ -111,8 +130,10 @@ test("Windows taskkill termination reports success, missing process, and ENOENT 
   assert.ok(childCalls.some((entry) => entry[0] === "taskkill" && entry.includes("9001")));
 
   const calls = [];
+  const alive = new Set([4242]);
   const enoent = terminateProcessTree(4242, {
     platform: "win32",
+    settleMs: 0,
     runCommandImpl: () => {
       const error = new Error("not found");
       error.code = "ENOENT";
@@ -120,10 +141,21 @@ test("Windows taskkill termination reports success, missing process, and ENOENT 
     },
     killImpl(pid, signal) {
       calls.push([pid, signal]);
+      if (signal === 0) {
+        if (!alive.has(pid)) {
+          const error = new Error("gone");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      if (signal === "SIGKILL") {
+        alive.delete(pid);
+      }
     }
   });
-  assert.deepEqual(calls, [[4242, "SIGTERM"]]);
-  assert.equal(enoent.method, "process");
+  assert.deepEqual(calls, [[4242, "SIGTERM"], [4242, 0], [4242, "SIGKILL"]]);
+  assert.equal(enoent.method, "process+sigkill");
   assert.equal(enoent.delivered, true);
 });
 
@@ -131,6 +163,7 @@ test("POSIX termination also signals recorded child PIDs and pgrep descendants",
   const calls = [];
   const result = terminateProcessTree(100, {
     platform: "linux",
+    settleMs: 0,
     childPids: [200],
     runCommandImpl(command, args) {
       if (command === "pgrep" && args[0] === "-P" && args[1] === "100") {
@@ -145,12 +178,17 @@ test("POSIX termination also signals recorded child PIDs and pgrep descendants",
         error.code = "ESRCH";
         throw error;
       }
+      if (signal === 0) {
+        const error = new Error("gone");
+        error.code = "ESRCH";
+        throw error;
+      }
     }
   });
   assert.equal(result.delivered, true);
-  assert.ok(calls.some((entry) => entry[0] === 100));
-  assert.ok(calls.some((entry) => entry[0] === 200));
-  assert.ok(calls.some((entry) => entry[0] === 300));
+  assert.ok(calls.some((entry) => entry[0] === 100 && entry[1] === "SIGTERM"));
+  assert.ok(calls.some((entry) => entry[0] === 200 && entry[1] === "SIGTERM"));
+  assert.ok(calls.some((entry) => entry[0] === 300 && entry[1] === "SIGTERM"));
   assert.match(result.method, /tree|process/);
 });
 

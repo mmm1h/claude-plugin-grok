@@ -10,6 +10,10 @@
   `*.test.mjs` on every OS and Node version in the matrix.
 - CI matrix now includes `macos-latest` (ubuntu / windows / macos × Node 18.18
   and 22).
+- Orphan dead-worker reconciliation no longer loses `phase: process-exited`
+  when a SIGTERM'd job-worker still finalizes as `failed`. Job CAS preserves
+  process-exited attribution, and POSIX termination escalates to SIGKILL when
+  the tree is still alive after SIGTERM.
 
 ### Documentation
 

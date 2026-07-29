@@ -660,51 +660,96 @@ export function terminateProcessTree(pid, options = {}) {
     }
   }
 
-  if (platform !== "win32") {
-    // Prefer process-group signal so a detached/session-leader worker and its Grok child die together.
-    const group = tryKill(kill, -pid, "SIGTERM");
-    if (group.ok) {
-      let method = "process-group";
-      for (const child of tree) {
-        const childKill = tryKill(kill, child, "SIGTERM");
-        if (childKill.ok) {
-          method = "process-group+tree";
-        } else if (childKill.code && childKill.code !== "ESRCH") {
-          throw childKill.error;
-        }
-      }
-      return { attempted: true, delivered: true, method };
-    }
-    if (group.code && group.code !== "ESRCH" && group.code !== "EPERM") {
-      // Unexpected group-kill failure: still try direct targets below.
-    }
-  }
-
-  // Direct PID + descendant fallback (group missing, Windows without taskkill, etc.).
-  let delivered = false;
-  let method = null;
   const targets = platform === "win32" ? [pid, ...extraChildren] : [pid, ...tree];
-  for (const target of targets) {
-    const result = tryKill(kill, target, "SIGTERM");
-    if (result.ok) {
-      delivered = true;
-      if (!method) {
-        method = target === pid ? "process" : "process-tree";
-      } else if (method === "process" && target !== pid) {
-        method = "process+tree";
+  const settleMs = options.settleMs ?? (platform === "win32" ? 0 : 50);
+  const sleep = options.sleepImpl ?? sleepSyncMs;
+
+  const signalTargets = (signal, { preferGroup }) => {
+    let delivered = false;
+    let method = null;
+
+    if (preferGroup && platform !== "win32") {
+      // Prefer process-group signal so a detached/session-leader worker and its
+      // Grok child die together.
+      const group = tryKill(kill, -pid, signal);
+      if (group.ok) {
+        delivered = true;
+        method = "process-group";
+        for (const child of tree) {
+          const childKill = tryKill(kill, child, signal);
+          if (childKill.ok) {
+            method = "process-group+tree";
+          } else if (childKill.code && childKill.code !== "ESRCH") {
+            throw childKill.error;
+          }
+        }
+        return { delivered, method };
       }
-      continue;
+      if (group.code && group.code !== "ESRCH" && group.code !== "EPERM") {
+        // Unexpected group-kill failure: still try direct targets below.
+      }
     }
-    if (result.code === "ESRCH") {
-      continue;
+
+    for (const target of targets) {
+      const result = tryKill(kill, target, signal);
+      if (result.ok) {
+        delivered = true;
+        if (!method) {
+          method = target === pid ? "process" : "process-tree";
+        } else if (method === "process" && target !== pid) {
+          method = "process+tree";
+        }
+        continue;
+      }
+      if (result.code === "ESRCH") {
+        continue;
+      }
+      if (result.code === "EPERM") {
+        delivered = true;
+        method = method ?? (target === pid ? "process" : "process-tree");
+        continue;
+      }
+      throw result.error;
     }
-    if (result.code === "EPERM") {
-      delivered = true;
-      method = method ?? (target === pid ? "process" : "process-tree");
-      continue;
+
+    return { delivered, method: method ?? (delivered ? "process" : null) };
+  };
+
+  const first = signalTargets("SIGTERM", { preferGroup: true });
+  const anyTargetAlive = () => {
+    const seen = new Set();
+    for (const target of [pid, ...targets]) {
+      if (!Number.isInteger(target) || target <= 0 || seen.has(target)) {
+        continue;
+      }
+      seen.add(target);
+      if (signalAlive(target, kill)) {
+        return true;
+      }
     }
-    throw result.error;
+    return false;
+  };
+  // Give a brief settle, then escalate so workers cannot finalize after SIGTERM
+  // and race orphan reconciliation into a plain failed phase.
+  if (first.delivered && settleMs >= 0) {
+    if (settleMs > 0) {
+      sleep(settleMs);
+    }
+    if (anyTargetAlive()) {
+      const second = signalTargets("SIGKILL", { preferGroup: true });
+      return {
+        attempted: true,
+        delivered: first.delivered || second.delivered,
+        method: second.method
+          ? `${first.method ?? "process"}+sigkill`
+          : (first.method ?? "process")
+      };
+    }
   }
 
-  return { attempted: true, delivered, method: method ?? "process" };
+  return {
+    attempted: true,
+    delivered: first.delivered,
+    method: first.method ?? "process"
+  };
 }
