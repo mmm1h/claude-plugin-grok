@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -24,6 +24,165 @@ export function runCommand(command, args = [], options = {}) {
     stderr: result.stderr ?? "",
     error: result.error ?? null
   };
+}
+
+const timeoutKillWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(milliseconds) {
+  if (milliseconds > 0) {
+    Atomics.wait(timeoutKillWaiter, 0, 0, milliseconds);
+  }
+}
+
+/**
+ * Like runCommand, but on timeout terminates the whole process tree.
+ *
+ * Node's spawnSync timeout only kills the direct child. On Windows that leaves
+ * grandchildren (e.g. the real Grok worker under grok-companion) orphaned and
+ * holding cwd / temp handles — a known source of EPERM during cleanup.
+ */
+export function runCommandWithTimeout(command, args = [], options = {}) {
+  const timeoutMs = options.timeout;
+  if (timeoutMs == null) {
+    return Promise.resolve(runCommand(command, args, options));
+  }
+
+  const env = options.env ?? process.env;
+  const cwd = options.cwd;
+  const maxBuffer = options.maxBuffer ?? 16 * 1024 * 1024;
+  const spawnImpl = options.spawnImpl ?? spawn;
+  const terminateImpl = options.terminateImpl ?? terminateProcessTree;
+  const platform = options.platform ?? process.platform;
+  const input = options.input;
+  // Windows keeps directory handles briefly after taskkill; keep this short so
+  // fail-closed hooks still return promptly.
+  const settleMs = options.settleMs ?? (platform === "win32" ? 50 : 0);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    let stdout = "";
+    let stderr = "";
+    let outputBytes = 0;
+    let timer = null;
+    let forceTimer = null;
+    const recordedChildPids = Array.isArray(options.childPids) ? [...options.childPids] : [];
+
+    const child = spawnImpl(command, args, {
+      cwd,
+      env,
+      shell: options.shell ?? false,
+      windowsHide: true,
+      windowsVerbatimArguments: options.windowsVerbatimArguments,
+      stdio: input != null ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"]
+    });
+
+    const killTree = () => {
+      const pid = child.pid;
+      if (!Number.isInteger(pid) || pid <= 0) {
+        return;
+      }
+      try {
+        terminateImpl(pid, {
+          platform,
+          cwd,
+          env,
+          childPids: recordedChildPids
+        });
+      } catch {
+        // Prefer reporting the timeout over a secondary kill failure.
+      }
+    };
+
+    const finish = ({ status = null, signal = null, error = null } = {}) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (forceTimer) {
+        clearTimeout(forceTimer);
+      }
+      let finalError = error;
+      if (timedOut && !finalError) {
+        finalError = Object.assign(new Error(`Command timed out after ${timeoutMs} ms: ${command}`), {
+          code: "ETIMEDOUT",
+          errno: "ETIMEDOUT",
+          syscall: "spawn",
+          spawnargs: args
+        });
+      }
+      // Settle synchronously so short-lived hooks always emit their decision
+      // before process exit (unref'd timers can drop the promise resolution).
+      if (timedOut && settleMs > 0) {
+        sleepSyncMs(settleMs);
+      }
+      resolve({
+        command,
+        args,
+        pid: Number.isInteger(child.pid) ? child.pid : null,
+        status: timedOut ? null : status,
+        signal: timedOut ? null : signal,
+        stdout,
+        stderr,
+        error: finalError,
+        timedOut
+      });
+    };
+
+    const append = (kind, chunk) => {
+      if (settled) {
+        return;
+      }
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > maxBuffer) {
+        killTree();
+        finish({
+          error: Object.assign(new Error("stdout maxBuffer exceeded"), {
+            code: "ENOBUFS"
+          })
+        });
+        return;
+      }
+      if (kind === "stdout") {
+        stdout += chunk.toString();
+      } else {
+        stderr += chunk.toString();
+      }
+    };
+
+    child.stdout?.on("data", (chunk) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk) => append("stderr", chunk));
+
+    if (input != null) {
+      child.stdin?.write(String(input));
+      child.stdin?.end();
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        killTree();
+        // If the tree refuses to die, still unblock the caller.
+        forceTimer = setTimeout(() => {
+          killTree();
+          finish();
+        }, 2_000);
+        forceTimer.unref?.();
+      }, timeoutMs);
+      // Keep the timeout timer referenced so short-lived scripts cannot exit
+      // before the kill + fail-closed decision path runs.
+    }
+
+    child.once("error", (error) => {
+      finish({ error, status: 1 });
+    });
+    child.once("close", (code, signal) => {
+      finish({ status: code ?? (timedOut ? null : 1), signal });
+    });
+  });
 }
 
 export function formatCommandFailure(result) {
@@ -182,7 +341,14 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 }
 
 function missingProcess(text) {
-  return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+  // Include localized Windows taskkill messages (e.g. 找不到 / 没有找到).
+  return /not found|no running instance|cannot find|does not exist|no such process|找不到|没有找到|无法找到/i.test(text);
+}
+
+function taskkillPartialFailure(text) {
+  // taskkill /T can return non-zero when some children refuse (access denied,
+  // "operation not supported") even after the target tree is mostly dead.
+  return /access is denied|操作不支持|拒绝访问|could not be terminated|无法终止/i.test(text);
 }
 
 function parseWindowsDate(value) {
@@ -378,6 +544,8 @@ export function isProcessAlive(pid, options = {}) {
 
 function collectDescendantPids(pid, options = {}) {
   const platform = options.platform ?? process.platform;
+  // Windows uses taskkill /T for tree kill; PowerShell CIM walks are too slow for
+  // the hot timeout path (must stay well under a second under concurrent load).
   if (platform === "win32") {
     return [];
   }
@@ -435,22 +603,6 @@ export function terminateProcessTree(pid, options = {}) {
     }
   }
 
-  if (platform === "win32") {
-    const result = run("taskkill", ["/PID", String(pid), "/T", "/F"], {
-      cwd: options.cwd,
-      env: options.env
-    });
-    if (!result.error && result.status === 0) {
-      return { attempted: true, delivered: true, method: "taskkill", result };
-    }
-    if (!result.error && missingProcess(`${result.stdout}\n${result.stderr}`)) {
-      return { attempted: true, delivered: false, method: "taskkill", result };
-    }
-    if (result.error?.code !== "ENOENT") {
-      throw result.error ?? new Error(formatCommandFailure(result));
-    }
-  }
-
   // Explicit child PIDs (e.g. recorded Grok worker children) are always targeted.
   const extraChildren = Array.isArray(options.childPids)
     ? options.childPids.filter((value) => Number.isInteger(value) && value > 0 && value !== pid)
@@ -459,6 +611,54 @@ export function terminateProcessTree(pid, options = {}) {
     ? []
     : collectDescendantPids(pid, { ...options, runCommandImpl: run });
   const tree = [...new Set([...extraChildren, ...descendants])];
+
+  if (platform === "win32") {
+    const result = run("taskkill", ["/PID", String(pid), "/T", "/F"], {
+      cwd: options.cwd,
+      env: options.env
+    });
+    if (result.error?.code === "ENOENT") {
+      // taskkill missing — fall through to direct kill below.
+    } else if (result.error) {
+      throw result.error;
+    } else {
+      const combined = `${result.stdout}\n${result.stderr}`;
+      let delivered = result.status === 0;
+      // Partial tree failures still count as a delivered kill attempt when the
+      // parent is gone or taskkill reported a known soft failure. Callers that
+      // need certainty also check isProcessAlive.
+      if (!delivered && !missingProcess(combined) && taskkillPartialFailure(combined)) {
+        delivered = !signalAlive(pid, kill);
+      } else if (!delivered && missingProcess(combined)) {
+        delivered = false;
+      } else if (!delivered && result.status !== 0) {
+        // Unknown non-zero: still treat as attempted; delivered if parent died.
+        delivered = !signalAlive(pid, kill);
+      }
+
+      let childDelivered = false;
+      for (const target of extraChildren) {
+        const childKill = run("taskkill", ["/PID", String(target), "/T", "/F"], {
+          cwd: options.cwd,
+          env: options.env
+        });
+        if (!childKill.error && childKill.status === 0) {
+          childDelivered = true;
+        } else if (!childKill.error && !missingProcess(`${childKill.stdout}\n${childKill.stderr}`)) {
+          if (!signalAlive(target, kill)) {
+            childDelivered = true;
+          }
+        }
+      }
+
+      return {
+        attempted: true,
+        delivered: delivered || childDelivered,
+        method: childDelivered ? "taskkill+children" : "taskkill",
+        result
+      };
+    }
+  }
 
   if (platform !== "win32") {
     // Prefer process-group signal so a detached/session-leader worker and its Grok child die together.
@@ -483,7 +683,7 @@ export function terminateProcessTree(pid, options = {}) {
   // Direct PID + descendant fallback (group missing, Windows without taskkill, etc.).
   let delivered = false;
   let method = null;
-  const targets = platform === "win32" ? [pid] : [pid, ...tree];
+  const targets = platform === "win32" ? [pid, ...extraChildren] : [pid, ...tree];
   for (const target of targets) {
     const result = tryKill(kill, target, "SIGTERM");
     if (result.ok) {

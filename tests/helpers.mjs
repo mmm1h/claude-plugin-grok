@@ -13,6 +13,31 @@ export function tempDir(prefix = "grok-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+const RM_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"]);
+const RM_RETRY_DELAYS_MS = [20, 50, 100, 200, 400, 800];
+const rmWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Windows can keep directory handles briefly after child-tree termination
+ * (and under AV scanners). Retry the same codes as atomic rename recovery.
+ */
+export function removeTempDir(dir) {
+  if (!dir) {
+    return;
+  }
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      return;
+    } catch (error) {
+      if (!RM_RETRY_CODES.has(error?.code) || attempt >= RM_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+      Atomics.wait(rmWaiter, 0, 0, RM_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 export function run(command, args, options = {}) {
   return spawnSync(command, args, {
     cwd: options.cwd ?? ROOT,

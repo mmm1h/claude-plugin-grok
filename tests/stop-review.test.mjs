@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { COMPANION, fakeGrokEnv, initRepo, PLUGIN_ROOT, run, tempDir } from "./helpers.mjs";
+import { COMPANION, fakeGrokEnv, initRepo, PLUGIN_ROOT, removeTempDir, run, tempDir } from "./helpers.mjs";
 import {
   parseStopReviewDecision,
   validateStopReviewResult
@@ -61,7 +61,7 @@ test("task --stop-review uses the stop schema and read-only sandbox", (t) => {
   fs.mkdirSync(repo);
   initRepo(repo);
   const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const response = runCompanion(
     ["task", "--stop-review", "--json", "--cwd", repo, "review the previous edit"],
@@ -91,7 +91,7 @@ test("enabled hook short-circuits an empty message in a clean working tree", (t)
   initRepo(repo);
   const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
   enableGate(repo, env);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const response = run(process.execPath, [STOP_REVIEW_HOOK], {
     cwd: repo,
@@ -111,7 +111,7 @@ test("enabled hook short-circuits status turns when the working tree is clean", 
   initRepo(repo);
   const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_CAPTURE: capture });
   enableGate(repo, env);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const response = run(process.execPath, [STOP_REVIEW_HOOK], {
     cwd: repo,
@@ -136,7 +136,7 @@ test("enabled hook short-circuits outside a git repository", (t) => {
   fs.mkdirSync(repo);
   initRepo(repo);
   enableGate(repo, env);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const nonGit = path.join(root, "plain");
   fs.mkdirSync(nonGit);
@@ -167,7 +167,7 @@ test("enabled hook emits structured blocks and fails closed on invalid output", 
   const state = path.join(root, "state");
   const baseEnv = fakeGrokEnv(state);
   enableGate(repo, baseEnv);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
   const input = JSON.stringify({
     cwd: repo,
     session_id: "edit-session",
@@ -207,7 +207,7 @@ test("enabled hook accepts legacy allow and block output after schema parsing fa
   fs.writeFileSync(path.join(repo, "app.js"), "export const value = 3;\n", "utf8");
   const baseEnv = fakeGrokEnv(path.join(root, "state"));
   enableGate(repo, baseEnv);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
   const input = JSON.stringify({
     cwd: repo,
     session_id: "legacy-session",
@@ -245,7 +245,7 @@ test("enabled hook fails closed when Grok is unavailable", (t) => {
   });
   // enableGate needs a working binary; use real fake first, then point at missing.
   enableGate(repo, fakeGrokEnv(path.join(root, "state")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const response = run(process.execPath, [STOP_REVIEW_HOOK], {
     cwd: repo,
@@ -270,7 +270,7 @@ test("enabled hook can fail open on unavailable Grok when explicitly opted in", 
   initRepo(repo);
   fs.writeFileSync(path.join(repo, "app.js"), "export const value = 5;\n", "utf8");
   enableGate(repo, fakeGrokEnv(path.join(root, "state")));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   const response = run(process.execPath, [STOP_REVIEW_HOOK], {
     cwd: repo,
@@ -297,7 +297,7 @@ test("enabled hook fails closed on ETIMEDOUT from the review subprocess", (t) =>
   fs.writeFileSync(path.join(repo, "app.js"), "export const value = 6;\n", "utf8");
   const baseEnv = fakeGrokEnv(path.join(root, "state"));
   enableGate(repo, baseEnv);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeTempDir(root));
 
   // Short gate timeout + slow fake Grok → spawnSync ETIMEDOUT → fail-closed block.
   const response = run(process.execPath, [STOP_REVIEW_HOOK], {
@@ -338,7 +338,7 @@ test("enabled hook prepends active job note when blocking a dirty tree", (t) => 
     } else {
       process.env.GROK_COMPANION_HOME = previousHome;
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    removeTempDir(root);
   });
 
   const job = {

@@ -8,6 +8,12 @@
   shell; prefers `.exe`, and runs `.cmd`/`.bat` via `ComSpec /d /s /c` with
   explicit quoting while keeping `shell:false` so prompts never land on a
   command line.
+- Stop-review gate timeouts now terminate the whole companion process tree
+  instead of relying on `spawnSync` timeout (which only kills the direct child
+  and can leave a nested Grok worker holding Windows temp-directory locks).
+- Windows `taskkill` partial failures (access denied / unsupported child) no
+  longer throw when the target process is already gone, so cancel and orphan
+  reaping stay reliable under concurrent load.
 - Stopped leaking orphaned Grok processes: foreground runs no longer detach,
   SIGINT/SIGTERM terminate the process tree, and cancel kills the whole tree
   via process group plus `pgrep` fallback.

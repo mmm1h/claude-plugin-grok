@@ -11,10 +11,11 @@ import {
   quoteWindowsCmdArg,
   resolveExecutable,
   resolveSpawnInvocation,
+  runCommandWithTimeout,
   terminateProcessTree
 } from "../plugins/grok/scripts/lib/process.mjs";
 import { readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/grok/scripts/lib/state.mjs";
-import { initRepo, tempDir } from "./helpers.mjs";
+import { initRepo, removeTempDir, tempDir } from "./helpers.mjs";
 
 test("POSIX termination falls back from a missing process group to the process", () => {
   const calls = [];
@@ -74,6 +75,40 @@ test("Windows taskkill termination reports success, missing process, and ENOENT 
   assert.equal(missing.method, "taskkill");
   assert.equal(missing.delivered, false);
   assert.equal(missing.attempted, true);
+
+  // Partial tree failures (access denied / 操作不支持) must not throw when the
+  // parent is already gone — cancel paths rely on a soft delivered result.
+  const partial = terminateProcessTree(4242, {
+    platform: "win32",
+    runCommandImpl: () => ({
+      status: 128,
+      stdout: "",
+      stderr: "ERROR: The process with PID 9001 (child process of PID 4242) could not be terminated.\nReason: Access is denied.\n",
+      error: null
+    }),
+    killImpl() {
+      const error = new Error("gone");
+      error.code = "ESRCH";
+      throw error;
+    }
+  });
+  assert.equal(partial.attempted, true);
+  assert.equal(partial.delivered, true);
+  assert.equal(partial.method, "taskkill");
+
+  // Explicit childPids are taskkilled even when the parent tree kill succeeds.
+  const childCalls = [];
+  const withChild = terminateProcessTree(4242, {
+    platform: "win32",
+    childPids: [9001],
+    runCommandImpl(command, args) {
+      childCalls.push([command, ...args]);
+      return { status: 0, stdout: "SUCCESS", stderr: "", error: null };
+    }
+  });
+  assert.equal(withChild.delivered, true);
+  assert.equal(withChild.method, "taskkill+children");
+  assert.ok(childCalls.some((entry) => entry[0] === "taskkill" && entry.includes("9001")));
 
   const calls = [];
   const enoent = terminateProcessTree(4242, {
@@ -262,6 +297,48 @@ test("binaryAvailable uses resolved Windows path without requiring shell:true", 
   assert.equal(result.available, true);
   assert.equal(result.command, "C:\\tools\\grok.exe");
   assert.ok(calls.some((call) => call.command === "C:\\tools\\grok.exe" && call.shell === false));
+});
+
+test("runCommandWithTimeout reaps nested children so Windows temp dirs unlock", async (t) => {
+  const root = tempDir();
+  const holder = path.join(root, "tree-holder.mjs");
+  // Parent keeps the temp cwd open and spawns a long-lived grandchild. A bare
+  // spawnSync timeout would kill only the parent and leave the grandchild
+  // locking the directory (EPERM on rmSync) — the stop-review gate flaky path.
+  fs.writeFileSync(
+    holder,
+    `
+import { spawn } from "node:child_process";
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: "ignore",
+  windowsHide: true
+});
+process.stdout.write(String(child.pid) + "\\n");
+setInterval(() => {}, 1000);
+`,
+    "utf8"
+  );
+  t.after(() => {
+    try {
+      removeTempDir(root);
+    } catch {
+      // The assertion below is the contract; best-effort cleanup if it failed.
+    }
+  });
+
+  const result = await runCommandWithTimeout(process.execPath, [holder], {
+    cwd: root,
+    timeout: 400,
+    settleMs: process.platform === "win32" ? 300 : 0
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.error?.code, "ETIMEDOUT");
+  const grandchildPid = Number(String(result.stdout).trim().split(/\r?\n/)[0]);
+  if (Number.isInteger(grandchildPid) && grandchildPid > 0) {
+    assert.equal(isProcessAlive(grandchildPid), false, `grandchild ${grandchildPid} should be reaped`);
+  }
+  removeTempDir(root);
+  assert.equal(fs.existsSync(root), false);
 });
 
 test("cancel helper does not report cancelled when termination is not delivered", (t) => {

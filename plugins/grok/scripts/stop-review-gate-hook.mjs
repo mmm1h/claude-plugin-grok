@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { getGrokAvailability } from "./lib/grok.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { runCommandWithTimeout } from "./lib/process.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { parseStopReviewDecision } from "./lib/stop-review.mjs";
@@ -69,11 +70,13 @@ function canSkipReview(cwd, _input) {
   return false;
 }
 
-function runReview(cwd, input) {
+async function runReview(cwd, input) {
   const prompt = interpolateTemplate(loadPromptTemplate(ROOT_DIR, "stop-review-gate"), {
     CLAUDE_RESPONSE_BLOCK: String(input.last_assistant_message ?? "").trim()
   });
-  const result = spawnSync(
+  // Do not use spawnSync({ timeout }): on Windows it only kills the direct child and
+  // can orphan the nested Grok worker (cwd locks → EPERM on temp cleanup).
+  const result = await runCommandWithTimeout(
     process.execPath,
     [
       path.join(SCRIPT_DIR, "grok-companion.mjs"),
@@ -91,12 +94,10 @@ function runReview(cwd, input) {
         ...(input.session_id ? { [CLAUDE_SESSION_ID_ENV]: input.session_id } : {})
       },
       input: prompt,
-      encoding: "utf8",
-      timeout: TIMEOUT_MS,
-      windowsHide: true
+      timeout: TIMEOUT_MS
     }
   );
-  if (result.error?.code === "ETIMEDOUT") {
+  if (result.error?.code === "ETIMEDOUT" || result.timedOut) {
     const minutes = Math.max(1, Math.round(TIMEOUT_MS / 60_000));
     return {
       allow: false,
@@ -129,7 +130,7 @@ function runReview(cwd, input) {
   return parseDecision(payload);
 }
 
-function main() {
+async function main() {
   const input = readInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -169,7 +170,7 @@ function main() {
     emitBlock([activeNote, message].filter(Boolean).join(" "));
     return;
   }
-  const decision = runReview(cwd, input);
+  const decision = await runReview(cwd, input);
   if (!decision.allow) {
     emitBlock([activeNote, decision.reason].filter(Boolean).join(" "));
   } else if (activeNote) {
@@ -177,9 +178,7 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
-}
+});
