@@ -1,0 +1,16 @@
+{
+  "name": "claude-plugin-grok",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Use the local Grok CLI from Claude Code for reviews, delegated tasks, transfers, and background jobs.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "bump-version": "node scripts/bump-version.mjs",
+    "check-version": "node scripts/bump-version.mjs --check",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

@@ -1,0 +1,11 @@
+claude-plugin-grok
+Copyright 2026 mmm1h
+
+Licensed under the Apache License, Version 2.0.
+
+The plugin's command, hook, skill, job-control, and repository layout were
+structurally informed by openai/codex-plugin-cc, Copyright OpenAI, L.L.C.,
+also distributed under the Apache License, Version 2.0.
+
+This project does not copy or include the Codex app-server, broker, generated
+protocol bindings, or codex.mjs runtime.

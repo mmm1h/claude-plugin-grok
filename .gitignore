@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+.DS_Store
+*.log
+*.tmp
+
+# Local scratch output. Keep only the requested implementation report.
+tmp/*
+!tmp/codex-out/
+tmp/codex-out/*
+!tmp/codex-out/impl-report.md
