@@ -14,7 +14,11 @@ import { parseStopReviewDecision } from "./lib/stop-review.mjs";
 import { CLAUDE_SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const TIMEOUT_MS = (() => {
+  const raw = Number(process.env.GROK_COMPANION_STOP_REVIEW_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
+})();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
@@ -77,7 +81,7 @@ function runReview(cwd, input) {
       "--read-only",
       "--stop-review",
       "--timeout-ms",
-      String(TIMEOUT_MS - 60_000),
+      String(Math.max(1_000, TIMEOUT_MS - 60_000)),
       "--json"
     ],
     {
@@ -93,9 +97,10 @@ function runReview(cwd, input) {
     }
   );
   if (result.error?.code === "ETIMEDOUT") {
+    const minutes = Math.max(1, Math.round(TIMEOUT_MS / 60_000));
     return {
       allow: false,
-      reason: "The Grok stop review timed out after 15 minutes. Run /grok:review --wait manually or disable the gate."
+      reason: `The Grok stop review timed out after ${minutes} minute${minutes === 1 ? "" : "s"}. Run /grok:review --wait manually or disable the gate.`
     };
   }
   let payload = null;
@@ -148,7 +153,20 @@ function main() {
   }
   const availability = getGrokAvailability(cwd);
   if (!availability.available) {
-    process.stderr.write(`Grok is unavailable for the review gate. Run /grok:setup.\n`);
+    // Default fail-closed when the gate is enabled: an unavailable CLI must not
+    // silently ALLOW a dirty tree. Operators can opt into the old fail-open path
+    // with GROK_COMPANION_STOP_REVIEW_FAIL_OPEN=1 (or true/yes).
+    const failOpen = /^(1|true|yes)$/i.test(String(process.env.GROK_COMPANION_STOP_REVIEW_FAIL_OPEN || ""));
+    const detail = availability.detail ? ` (${availability.detail})` : "";
+    const message = `skipped: unavailable — Grok is unavailable for the review gate${detail}. Run /grok:setup.`;
+    if (failOpen) {
+      process.stderr.write(`${message}\n`);
+      if (activeNote) {
+        process.stderr.write(`${activeNote}\n`);
+      }
+      return;
+    }
+    emitBlock([activeNote, message].filter(Boolean).join(" "));
     return;
   }
   const decision = runReview(cwd, input);

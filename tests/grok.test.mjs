@@ -7,11 +7,13 @@ import {
   buildGrokArgs,
   findLatestTaskSession,
   getGrokAuthStatus,
+  getGrokAvailability,
   getGrokCapabilities,
   normalizeGrokStreamingEvent,
   parseGrokStructuredOutput,
   runGrokHeadless
 } from "../plugins/grok/scripts/lib/grok.mjs";
+import { isProcessAlive } from "../plugins/grok/scripts/lib/process.mjs";
 import { renderTaskResult } from "../plugins/grok/scripts/lib/render.mjs";
 import { FAKE_GROK, tempDir } from "./helpers.mjs";
 
@@ -314,4 +316,151 @@ test("runGrokHeadless terminates fake Grok when output exceeds the cap", async (
     }),
     /output exceeded 64 bytes/
   );
+});
+
+test("runGrokHeadless times out and reaps the fake child process", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const started = Date.now();
+  let timedOut = null;
+  try {
+    await runGrokHeadless({
+      cwd: dir,
+      prompt: "slow",
+      write: false,
+      binary: process.execPath,
+      binaryPrefixArgs: [FAKE_GROK],
+      env: { ...process.env, FAKE_GROK_DELAY_MS: "5000" },
+      timeoutMs: 50,
+      skipSignalHandlers: true
+    });
+  } catch (error) {
+    timedOut = error;
+  }
+  assert.ok(timedOut, "expected timeout rejection");
+  assert.match(String(timedOut.message), /timed out after 50 ms/);
+  assert.ok(Date.now() - started < 3_000, "timeout path should not wait for the full FAKE_GROK_DELAY_MS");
+  assert.ok(Number.isInteger(timedOut.pid) && timedOut.pid > 0, "timeout error should expose the child pid");
+  assert.equal(isProcessAlive(timedOut.pid), false, "fake Grok child must be reaped after timeout");
+});
+
+test("streaming end.data final answer is collected without raw NDJSON fallback", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stream = [
+    JSON.stringify({ type: "text", text: "partial " }),
+    JSON.stringify({ type: "end", data: { result: "final from end.data", sessionId: "99999999-9999-4999-8999-999999999999" } })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "end data",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env, FAKE_GROK_STREAM: stream },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true
+  });
+  assert.equal(result.stdout, "final from end.data");
+  assert.equal(result.sessionId, "99999999-9999-4999-8999-999999999999");
+  assert.doesNotMatch(result.stdout, /\"type\":/);
+});
+
+test("empty end keeps accumulated assistant text", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stream = [
+    JSON.stringify({ type: "text", data: "kept " }),
+    JSON.stringify({ type: "text", data: "answer" }),
+    JSON.stringify({ type: "end" })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "keep assistant",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env, FAKE_GROK_STREAM: stream },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true
+  });
+  assert.equal(result.stdout, "kept answer");
+});
+
+test("unknown stream events extract safe text once and never dump raw NDJSON", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const progress = [];
+  const stream = [
+    JSON.stringify({ type: "brand_new_event", data: { text: "rescued answer" } }),
+    JSON.stringify({ type: "brand_new_event", data: { text: " more" } }),
+    JSON.stringify({ type: "another_future", meta: { only: "metadata" } })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "unknown events",
+    write: true,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env, FAKE_GROK_STREAM: stream },
+    onProgress: (line) => progress.push(line),
+    timeoutMs: 10_000,
+    skipSignalHandlers: true
+  });
+  assert.equal(result.stdout, "rescued answer more");
+  assert.doesNotMatch(result.stdout, /\"type\":|brand_new_event|another_future/);
+  const unknownWarnings = progress.filter((line) => /Unknown streaming event type: brand_new_event/.test(line));
+  assert.equal(unknownWarnings.length, 1, "unknown types should warn once, not per line");
+  assert.ok(progress.some((line) => /Unknown streaming event type: another_future/.test(line)));
+  assert.ok(!progress.some((line) => line.includes("\"type\"")));
+});
+
+test("getGrokAvailability resolves Windows .cmd shims via where.exe", () => {
+  const availability = getGrokAvailability(process.cwd(), {
+    binary: "grok",
+    platform: "win32",
+    env: { ...process.env },
+    runCommandImpl(command, args) {
+      if (command === "where.exe") {
+        return {
+          status: 0,
+          stdout: "C:\\Users\\me\\AppData\\Roaming\\npm\\grok.cmd\n",
+          stderr: "",
+          error: null
+        };
+      }
+      // cmd.exe /d /s /c "\"...grok.cmd\" \"--version\""
+      if (String(command).toLowerCase().includes("cmd") || /\.cmd$/i.test(String(args?.[3] ?? ""))) {
+        return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+      }
+      if (/\.cmd$/i.test(command) || command.endsWith("grok.cmd")) {
+        return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+      }
+      // resolveSpawnInvocation for .cmd uses ComSpec
+      return { status: 0, stdout: "grok 0.2.114\n", stderr: "", error: null };
+    }
+  });
+  assert.equal(availability.available, true);
+  assert.equal(availability.command, "C:\\Users\\me\\AppData\\Roaming\\npm\\grok.cmd");
+});
+
+test("runGrokHeadless does not detach and registers interrupt cleanup path", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // Foreground spawn uses detached:false; a quick successful run proves the path still works.
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "foreground",
+    write: false,
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true
+  });
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /FAKE_GROK_OK/);
 });

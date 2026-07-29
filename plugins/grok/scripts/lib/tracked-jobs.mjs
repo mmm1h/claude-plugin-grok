@@ -5,33 +5,53 @@ import {
   readJobFile,
   resolveJobFile,
   resolveJobLogFile,
+  updateJobFile,
   upsertJob,
   writeJobFile
 } from "./state.mjs";
 
 export const CLAUDE_SESSION_ID_ENV = "GROK_COMPANION_CLAUDE_SESSION_ID";
+const PROGRESS_MIN_INTERVAL_MS = 500;
+const SILENT_PROGRESS_EVENTS = /thought|thinking|reasoning|^text$/;
 
 export function nowIso() {
   return new Date().toISOString();
 }
 
+function warnLogIo(kind, logPath, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`[grok] Failed to ${kind} job log ${logPath ?? "(none)"}: ${message}\n`);
+}
+
 export function appendLogLine(logPath, message) {
-  const value = String(message ?? "").trim();
-  if (logPath && value) {
-    fs.appendFileSync(logPath, `[${nowIso()}] ${value}\n`, "utf8");
+  try {
+    const value = String(message ?? "").trim();
+    if (logPath && value) {
+      fs.appendFileSync(logPath, `[${nowIso()}] ${value}\n`, "utf8");
+    }
+  } catch (error) {
+    warnLogIo("append", logPath, error);
   }
 }
 
 export function appendLogBlock(logPath, title, body) {
-  const value = String(body ?? "").trimEnd();
-  if (logPath && value) {
-    fs.appendFileSync(logPath, `\n[${nowIso()}] ${title}\n${value}\n`, "utf8");
+  try {
+    const value = String(body ?? "").trimEnd();
+    if (logPath && value) {
+      fs.appendFileSync(logPath, `\n[${nowIso()}] ${title}\n${value}\n`, "utf8");
+    }
+  } catch (error) {
+    warnLogIo("append", logPath, error);
   }
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logPath = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logPath, "", "utf8");
+  try {
+    fs.writeFileSync(logPath, "", "utf8");
+  } catch (error) {
+    warnLogIo("create", logPath, error);
+  }
   appendLogLine(logPath, `Starting ${title}.`);
   return logPath;
 }
@@ -104,34 +124,92 @@ function writeIndex(workspaceRoot, record) {
   upsertJob(workspaceRoot, indexJobRecord(record));
 }
 
+function warnProgressFailure(jobId, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`[grok] progress update failed for ${jobId}: ${message}\n`);
+}
+
 export function createJobProgressUpdater({ workspaceRoot, jobId, logPath = null } = {}) {
+  let lastWriteAt = 0;
+  let lastPhase = null;
+  let lastSessionId = null;
+  let pendingIndexRecord = null;
+  let lastIndexWriteAt = 0;
+
+  const flushIndex = (force = false) => {
+    if (!pendingIndexRecord) {
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - lastIndexWriteAt < PROGRESS_MIN_INTERVAL_MS) {
+      return;
+    }
+    const record = pendingIndexRecord;
+    pendingIndexRecord = null;
+    lastIndexWriteAt = now;
+    writeIndex(workspaceRoot, record);
+  };
+
   return (telemetry) => {
-    if (!telemetry || typeof telemetry !== "object") {
-      return;
-    }
-    const latest = storedJob(workspaceRoot, jobId);
-    if (!latest || !["queued", "running"].includes(latest.status)) {
-      return;
-    }
-    const confirmedSessionId = telemetry.sessionId ?? null;
-    const progress = {
-      message: telemetry.message || telemetry.eventType || "Grok progress",
-      eventType: telemetry.eventType ?? "unknown",
-      at: telemetry.at ?? nowIso()
-    };
-    const patched = {
-      ...latest,
-      phase: telemetry.phase ?? latest.phase ?? "running",
-      sessionId: confirmedSessionId ?? latest.sessionId ?? null,
-      sessionConfirmed: confirmedSessionId ? true : Boolean(latest.sessionConfirmed),
-      resumable: false,
-      lastProgressAt: progress.at,
-      progress
-    };
-    writeJobFile(workspaceRoot, jobId, patched);
-    writeIndex(workspaceRoot, patched);
-    if (progress.message) {
-      appendLogLine(logPath ?? patched.logPath, progress.message);
+    try {
+      if (!telemetry || typeof telemetry !== "object") {
+        return;
+      }
+      if (telemetry.suppressProgress) {
+        return;
+      }
+      const eventType = String(telemetry.eventType ?? "unknown").toLowerCase();
+      if (SILENT_PROGRESS_EVENTS.test(eventType)) {
+        return;
+      }
+
+      const nextPhase = telemetry.phase ?? null;
+      const nextSessionId = telemetry.sessionId ?? null;
+      const phaseChanged = nextPhase != null && nextPhase !== lastPhase;
+      const sessionChanged = nextSessionId != null && nextSessionId !== lastSessionId;
+      const now = Date.now();
+      if (!phaseChanged && !sessionChanged && now - lastWriteAt < PROGRESS_MIN_INTERVAL_MS) {
+        return;
+      }
+
+      const progress = {
+        message: telemetry.message || telemetry.eventType || "Grok progress",
+        eventType: telemetry.eventType ?? "unknown",
+        at: telemetry.at ?? nowIso()
+      };
+
+      const patched = updateJobFile(workspaceRoot, jobId, (latest) => {
+        if (!["queued", "running"].includes(latest.status)) {
+          return null;
+        }
+        const confirmedSessionId = telemetry.sessionId ?? null;
+        return {
+          ...latest,
+          phase: telemetry.phase ?? latest.phase ?? "running",
+          sessionId: confirmedSessionId ?? latest.sessionId ?? null,
+          sessionConfirmed: confirmedSessionId ? true : Boolean(latest.sessionConfirmed),
+          resumable: false,
+          lastProgressAt: progress.at,
+          progress
+        };
+      });
+
+      if (!patched || !["queued", "running"].includes(patched.status)) {
+        return;
+      }
+
+      lastWriteAt = now;
+      lastPhase = patched.phase ?? lastPhase;
+      lastSessionId = patched.sessionId ?? lastSessionId;
+      pendingIndexRecord = patched;
+      // Coalesce index writes: flush immediately on phase/session change, else throttle.
+      flushIndex(phaseChanged || sessionChanged);
+
+      if (progress.message) {
+        appendLogLine(logPath ?? patched.logPath, progress.message);
+      }
+    } catch (error) {
+      warnProgressFailure(jobId, error);
     }
   };
 }
@@ -173,9 +251,15 @@ export async function runTrackedJob(job, runner, options = {}) {
       rendered: execution.rendered,
       errorMessage: execution.errorMessage ?? null
     };
+    // Terminal write first; CAS keeps cancelled if cancel won the race after the check above.
     writeJobFile(job.workspaceRoot, job.id, final);
-    writeIndex(job.workspaceRoot, final);
-    appendLogBlock(final.logPath, "Final output", execution.rendered || execution.payload?.rawOutput);
+    const stored = storedJob(job.workspaceRoot, job.id) ?? final;
+    writeIndex(job.workspaceRoot, stored);
+    if (stored.status === "cancelled") {
+      appendLogLine(stored.logPath, "Runner finished after cancellation; keeping cancelled status.");
+      return { ...execution, exitCode: 130, cancelled: true };
+    }
+    appendLogBlock(stored.logPath, "Final output", execution.rendered || execution.payload?.rawOutput);
     return execution;
   } catch (error) {
     const latest = storedJob(job.workspaceRoot, job.id);
@@ -194,8 +278,12 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage: message
     };
     writeJobFile(job.workspaceRoot, job.id, final);
-    writeIndex(job.workspaceRoot, final);
-    appendLogLine(final.logPath, `Failed: ${message}`);
+    const stored = storedJob(job.workspaceRoot, job.id) ?? final;
+    writeIndex(job.workspaceRoot, stored);
+    if (stored.status === "cancelled") {
+      return { exitCode: 130, cancelled: true, payload: null, rendered: "" };
+    }
+    appendLogLine(stored.logPath, `Failed: ${message}`);
     throw error;
   }
 }

@@ -1,4 +1,6 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
+import process from "node:process";
 
 import { isProcessAlive, terminateProcessTree } from "./process.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
@@ -11,6 +13,8 @@ import {
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
+/** Leave headroom under the SessionEnd hook timeout (60s). */
+export const DEFAULT_SESSION_END_CANCEL_BUDGET_MS = 55_000;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -105,12 +109,48 @@ export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
   return failed;
 }
 
-function reconciledJobs(workspaceRoot, options = {}) {
+/**
+ * Reconcile every indexed job (orphan PID → failed). Used by status/result paths.
+ */
+export function reconcileJobs(workspaceRoot, options = {}) {
   return listJobs(workspaceRoot).map((job) => reconcileOrphanedJob(workspaceRoot, job, options));
 }
 
-export function cancelTrackedJob(workspaceRoot, job, options = {}) {
+/**
+ * Reconcile jobs for the current Claude session (or all when options.all / no session).
+ *
+ * Wire this at companion entry points that must not see stale "running" orphans:
+ * - task (before findLatestTaskSession / enqueue)
+ * - task-resume-candidate
+ * - any other path that calls findLatestTaskSession
+ *
+ * status/result already reconcile via buildStatusSnapshot / resolveResultJob.
+ */
+export function reconcileSessionJobs(workspaceRoot, options = {}) {
+  const sessionId = currentClaudeSession(options);
+  const jobs = listJobs(workspaceRoot);
+  const scoped = sessionId && !options.all
+    ? jobs.filter((job) => job.claudeSessionId === sessionId)
+    : jobs;
+  return scoped.map((job) => reconcileOrphanedJob(workspaceRoot, job, options));
+}
+
+function reconciledJobs(workspaceRoot, options = {}) {
+  return reconcileJobs(workspaceRoot, options);
+}
+
+/**
+ * Persist cancel-requested without waiting for process termination.
+ * Used when SessionEnd is about to time out so later status can reclaim the job.
+ */
+export function markJobCancelRequested(workspaceRoot, job, options = {}) {
   const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+  if (!["queued", "running"].includes(stored.status) && stored.phase !== "cancel-requested") {
+    return stored;
+  }
+  if (stored.phase === "cancel-requested" && stored.cancelRequestedAt) {
+    return stored;
+  }
   const cancelRequestedAt = nowIso();
   const requested = persistJob(workspaceRoot, {
     ...stored,
@@ -121,6 +161,24 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
     errorMessage: null
   });
   appendLogLine(requested.logPath, `Cancellation requested${options.reason ? `: ${options.reason}` : "."}`);
+  return requested;
+}
+
+export function cancelTrackedJob(workspaceRoot, job, options = {}) {
+  const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+  const requested = options.alreadyMarked
+    ? (readStoredJob(workspaceRoot, job.id) ?? stored)
+    : markJobCancelRequested(workspaceRoot, job, options);
+  if (!["queued", "running"].includes(requested.status) && requested.phase !== "cancel-requested" && requested.phase !== "cancel-failed") {
+    return {
+      job: requested,
+      previousStatus: stored.status,
+      status: requested.status,
+      delivered: false,
+      method: null,
+      errorMessage: null
+    };
+  }
 
   let termination = { attempted: false, delivered: false, method: null };
   let terminationError = null;
@@ -166,6 +224,121 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
   });
   appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
   return { job: failed, previousStatus: stored.status, status: "cancel-failed", delivered: false, method: termination.method ?? null, errorMessage };
+}
+
+function budgetExhaustedResult(workspaceRoot, job, message) {
+  return {
+    job: readStoredJob(workspaceRoot, job.id) ?? job,
+    previousStatus: job.status,
+    status: "cancel-requested",
+    delivered: false,
+    method: null,
+    errorMessage: message
+  };
+}
+
+/**
+ * Cancel many jobs: mark cancel-requested immediately, then terminate in parallel child processes.
+ * Jobs still unfinished when the budget elapses remain cancel-requested for later status/result reclaim.
+ */
+export async function cancelTrackedJobsParallel(workspaceRoot, jobs, options = {}) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  if (list.length === 0) {
+    return [];
+  }
+  const budgetMs = options.budgetMs ?? DEFAULT_SESSION_END_CANCEL_BUDGET_MS;
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  const marked = list.map((job) => markJobCancelRequested(workspaceRoot, job, options));
+
+  if (typeof options.cancelImpl === "function") {
+    return Promise.all(marked.map(async (job) => {
+      if (Date.now() >= deadline) {
+        return budgetExhaustedResult(workspaceRoot, job, "SessionEnd cancel budget exhausted; left cancel-requested.");
+      }
+      return options.cancelImpl(job);
+    }));
+  }
+
+  // Child processes so Windows taskkill work does not serialize on one event loop.
+  return Promise.all(marked.map((job) => cancelJobInSubprocess(workspaceRoot, job, {
+    ...options,
+    timeoutMs: Math.max(1_000, deadline - Date.now())
+  })));
+}
+
+function cancelJobInSubprocess(workspaceRoot, job, options = {}) {
+  return new Promise((resolve) => {
+    const moduleUrl = new URL("./job-control.mjs", import.meta.url).href;
+    const inline = `
+import { cancelTrackedJob } from ${JSON.stringify(moduleUrl)};
+const input = JSON.parse(process.argv[1]);
+const result = cancelTrackedJob(input.workspaceRoot, input.job, {
+  reason: input.reason,
+  cancelledPhase: input.cancelledPhase,
+  alreadyMarked: true,
+  env: process.env
+});
+process.stdout.write(JSON.stringify(result));
+`;
+    const payload = JSON.stringify({
+      workspaceRoot,
+      job,
+      reason: options.reason ?? null,
+      cancelledPhase: options.cancelledPhase ?? "cancelled"
+    });
+    const child = spawn(process.execPath, ["--input-type=module", "-e", inline, payload], {
+      env: options.env ?? process.env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeoutMs = options.timeoutMs ?? DEFAULT_SESSION_END_CANCEL_BUDGET_MS;
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      finish(budgetExhaustedResult(workspaceRoot, job, "Cancel subprocess timed out; left cancel-requested."));
+    }, Math.max(500, timeoutMs));
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      finish(budgetExhaustedResult(workspaceRoot, job, error.message));
+    });
+    child.on("close", (code) => {
+      try {
+        if (code === 0 && stdout.trim()) {
+          finish(JSON.parse(stdout));
+          return;
+        }
+      } catch {
+        // fall through
+      }
+      finish(budgetExhaustedResult(
+        workspaceRoot,
+        job,
+        stderr.trim() || `Cancel subprocess exited ${code}`
+      ));
+    });
+  });
 }
 
 function matchReference(jobs, reference, predicate = () => true) {

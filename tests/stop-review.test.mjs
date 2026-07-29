@@ -8,6 +8,7 @@ import {
   parseStopReviewDecision,
   validateStopReviewResult
 } from "../plugins/grok/scripts/lib/stop-review.mjs";
+import { saveState, writeJobFile } from "../plugins/grok/scripts/lib/state.mjs";
 
 const STOP_REVIEW_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const STOP_REVIEW_SCHEMA = JSON.parse(
@@ -231,4 +232,143 @@ test("enabled hook accepts legacy allow and block output after schema parsing fa
     decision: "block",
     reason: "legacy reviewer found a regression"
   });
+});
+
+test("enabled hook fails closed when Grok is unavailable", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 4;\n", "utf8");
+  const baseEnv = fakeGrokEnv(path.join(root, "state"), {
+    GROK_COMPANION_GROK_BINARY: path.join(root, "missing-grok-binary")
+  });
+  // enableGate needs a working binary; use real fake first, then point at missing.
+  enableGate(repo, fakeGrokEnv(path.join(root, "state")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const response = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: repo,
+    env: baseEnv,
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "unavailable-session",
+      last_assistant_message: "Edited app.js."
+    })
+  });
+  assert.equal(response.status, 0, response.stderr);
+  const decision = JSON.parse(response.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /skipped: unavailable/);
+  assert.match(decision.reason, /\/grok:setup/);
+});
+
+test("enabled hook can fail open on unavailable Grok when explicitly opted in", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 5;\n", "utf8");
+  enableGate(repo, fakeGrokEnv(path.join(root, "state")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const response = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: repo,
+    env: fakeGrokEnv(path.join(root, "state"), {
+      GROK_COMPANION_GROK_BINARY: path.join(root, "missing-grok-binary"),
+      GROK_COMPANION_STOP_REVIEW_FAIL_OPEN: "1"
+    }),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "fail-open-session",
+      last_assistant_message: "Edited app.js."
+    })
+  });
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(response.stdout, "");
+  assert.match(response.stderr, /skipped: unavailable/);
+});
+
+test("enabled hook fails closed on ETIMEDOUT from the review subprocess", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 6;\n", "utf8");
+  const baseEnv = fakeGrokEnv(path.join(root, "state"));
+  enableGate(repo, baseEnv);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  // Short gate timeout + slow fake Grok → spawnSync ETIMEDOUT → fail-closed block.
+  const response = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: repo,
+    env: {
+      ...baseEnv,
+      GROK_COMPANION_STOP_REVIEW_TIMEOUT_MS: "800",
+      FAKE_GROK_DELAY_MS: "10000"
+    },
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "timeout-session",
+      last_assistant_message: "Edited app.js."
+    }),
+    timeout: 15_000
+  });
+  assert.equal(response.status, 0, response.stderr);
+  const decision = JSON.parse(response.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /timed out/);
+  assert.match(decision.reason, /\/grok:review --wait manually/);
+});
+
+test("enabled hook prepends active job note when blocking a dirty tree", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const stateHome = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 7;\n", "utf8");
+  const baseEnv = fakeGrokEnv(stateHome);
+  enableGate(repo, baseEnv);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = stateHome;
+  t.after(() => {
+    if (previousHome === undefined) {
+      delete process.env.GROK_COMPANION_HOME;
+    } else {
+      process.env.GROK_COMPANION_HOME = previousHome;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const job = {
+    id: "task-active-note",
+    kind: "task",
+    status: "running",
+    phase: "tool",
+    claudeSessionId: "active-note-session",
+    cwd: repo,
+    workspaceRoot: repo,
+    updatedAt: "2026-07-29T12:00:00.000Z"
+  };
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: { stopReviewGate: true }, jobs: [job] });
+
+  const blocked = run(process.execPath, [STOP_REVIEW_HOOK], {
+    cwd: repo,
+    env: {
+      ...baseEnv,
+      FAKE_GROK_OUTPUT: JSON.stringify({ decision: "block", reason: "Missing regression test." })
+    },
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "active-note-session",
+      last_assistant_message: "Updated app.js."
+    })
+  });
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const decision = JSON.parse(blocked.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /Grok job task-active-note is still running/);
+  assert.match(decision.reason, /Missing regression test/);
 });

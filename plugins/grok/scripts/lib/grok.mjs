@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { createTempDir } from "./fs.mjs";
-import { binaryAvailable, runCommand, terminateProcessTree } from "./process.mjs";
+import { binaryAvailable, resolveSpawnInvocation, runCommand, terminateProcessTree } from "./process.mjs";
 import { listJobs } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -35,21 +35,34 @@ function grokPrefixArgs(options = {}) {
 }
 
 export function getGrokAvailability(cwd, options = {}) {
+  const binary = grokBinary(options);
+  const availability = binaryAvailable(binary, ["--version"], {
+    cwd,
+    env: options.env,
+    platform: options.platform,
+    runCommandImpl: options.runCommandImpl
+  });
   return {
-    command: grokBinary(options),
-    ...binaryAvailable(grokBinary(options), ["--version"], {
-      cwd,
-      env: options.env
-    })
+    command: availability.command ?? binary,
+    ...availability
   };
 }
 
 export function getGrokCapabilities(cwd, options = {}) {
-  const command = grokBinary(options);
-  const result = runCommand(command, [...grokPrefixArgs(options), "--help"], {
+  const binary = grokBinary(options);
+  const helpArgs = [...grokPrefixArgs(options), "--help"];
+  const invocation = resolveSpawnInvocation(binary, helpArgs, {
     cwd,
     env: options.env,
-    shell: false
+    platform: options.platform,
+    runCommandImpl: options.runCommandImpl
+  });
+  const run = options.runCommandImpl ?? runCommand;
+  const result = run(invocation.command, invocation.args, {
+    cwd,
+    env: options.env,
+    shell: false,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments
   });
   if (result.error || result.status !== 0) {
     return {
@@ -391,12 +404,15 @@ function parsedSessionId(stdout, stderr) {
   return labelled?.[1] ?? null;
 }
 
-function streamText(value) {
+function streamText(value, depth = 0) {
+  if (depth > 8) {
+    return "";
+  }
   if (typeof value === "string") {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map(streamText).join("");
+    return value.map((entry) => streamText(entry, depth + 1)).join("");
   }
   if (!value || typeof value !== "object") {
     return "";
@@ -405,15 +421,44 @@ function streamText(value) {
     return value.text;
   }
   if (typeof value.content === "string" || Array.isArray(value.content)) {
-    return streamText(value.content);
+    return streamText(value.content, depth + 1);
   }
   if (value.message != null) {
-    return streamText(value.message);
+    return streamText(value.message, depth + 1);
   }
   if (value.delta != null) {
-    return streamText(value.delta);
+    return streamText(value.delta, depth + 1);
+  }
+  // CLI variants may nest the answer under .data (including type=end payloads).
+  if (value.data != null) {
+    const nested = streamText(value.data, depth + 1);
+    if (nested) {
+      return nested;
+    }
+  }
+  if (typeof value.result === "string") {
+    return value.result;
+  }
+  if (typeof value.output === "string") {
+    return value.output;
   }
   return "";
+}
+
+function collectStreamText(event) {
+  if (!event || typeof event !== "object") {
+    return "";
+  }
+  return streamText(
+    event.result
+      ?? event.output
+      ?? event.message
+      ?? event.content
+      ?? event.text
+      ?? event.data
+      ?? event.delta
+      ?? null
+  );
 }
 
 function streamSessionId(event) {
@@ -489,6 +534,8 @@ function createStreamingCollector(options = {}) {
   let observedSessionId = null;
   const finalTexts = [];
   const assistantTexts = [];
+  const warnedUnknownTypes = new Set();
+  let warnedUnknownFallback = false;
 
   const acceptLine = (line) => {
     const raw = String(line).trim();
@@ -512,11 +559,14 @@ function createStreamingCollector(options = {}) {
     options.onTelemetry?.(telemetry, event);
 
     const type = telemetry.eventType.toLowerCase();
-    const finalText = /result|final|complete|^end$/.test(type)
-      ? streamText(event.result ?? event.output ?? event.message ?? event.content ?? event.text)
-      : "";
-    if (finalText.trim()) {
-      finalTexts.push(finalText);
+    const known = KNOWN_STREAM_EVENT_TYPES.test(telemetry.eventType);
+
+    if (/result|final|complete|^end$/.test(type)) {
+      // Prefer explicit final fields (including event.data); empty end keeps assistant text.
+      const finalText = collectStreamText(event);
+      if (finalText.trim()) {
+        finalTexts.push(finalText);
+      }
     } else if (/assistant|message|content|delta|^text$/.test(type)) {
       const assistantText = streamText(
         event.data ?? event.message ?? event.delta ?? event.content ?? event.text ?? event
@@ -524,12 +574,21 @@ function createStreamingCollector(options = {}) {
       if (assistantText) {
         assistantTexts.push(assistantText);
       }
+    } else if (!known) {
+      // Future event types: extract safe text without dumping the full NDJSON line.
+      const extracted = collectStreamText(event);
+      if (extracted.trim()) {
+        assistantTexts.push(extracted);
+      }
+      if (!warnedUnknownTypes.has(telemetry.eventType)) {
+        warnedUnknownTypes.add(telemetry.eventType);
+        options.onProgress?.(`Unknown streaming event type: ${telemetry.eventType}`);
+      }
     }
+
     // Never echo raw unknown JSON into progress (leaks thought tokens into Claude context).
     // Known thought/text/end/usage events are intentionally silent in progress.
-    if (!KNOWN_STREAM_EVENT_TYPES.test(telemetry.eventType) && !telemetry.suppressProgress) {
-      options.onProgress?.(`Unknown streaming event type: ${telemetry.eventType}`);
-    } else if (telemetry.message && /tool|command|function|session/.test(type) && !telemetry.suppressProgress) {
+    if (known && telemetry.message && /tool|command|function|session/.test(type) && !telemetry.suppressProgress) {
       options.onProgress?.(telemetry.message);
     }
   };
@@ -550,9 +609,23 @@ function createStreamingCollector(options = {}) {
     result(rawOutput) {
       const finalText = finalTexts.at(-1)?.trimEnd();
       const assistantText = assistantTexts.join("").trimEnd();
+      // Prefer collected answer text. Never fall back to full raw NDJSON on stdout —
+      // that pollutes Claude context when only unknown event types were seen.
+      if (finalText || assistantText) {
+        return {
+          stdout: finalText || assistantText,
+          observedSessionId
+        };
+      }
+      const raw = String(rawOutput ?? "").trimEnd();
+      if (raw && !warnedUnknownFallback) {
+        warnedUnknownFallback = true;
+        options.onProgress?.("Streaming produced no extractable answer text; suppressing raw NDJSON fallback.");
+      }
       return {
-        stdout: finalText || assistantText || String(rawOutput ?? "").trimEnd(),
-        observedSessionId
+        stdout: "",
+        observedSessionId,
+        rawSuppressed: Boolean(raw)
       };
     }
   };
@@ -570,19 +643,31 @@ export async function runGrokHeadless(options = {}) {
   }
 
   const built = buildGrokArgs({ ...options, promptFile });
-  const command = grokBinary(options);
+  const binary = grokBinary(options);
+  // Resolve Windows npm .cmd shims without shell:true (prompt must never be shell-concatenated).
+  const invocation = resolveSpawnInvocation(binary, built.args, {
+    cwd,
+    env: childEnv,
+    platform: options.platform,
+    runCommandImpl: options.runCommandImpl
+  });
+  const command = invocation.resolved;
   const streaming = options.outputFormat === "streaming-json"
     ? createStreamingCollector(options)
     : null;
   const startedAt = Date.now();
   try {
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(command, built.args, {
+      // Never detach the foreground Grok child: Ctrl-C / SIGTERM must reclaim it.
+      // Background workers already set GROK_COMPANION_BACKGROUND_WORKER=1 and run
+      // under a detached companion worker process that owns lifecycle.
+      const child = spawn(invocation.command, invocation.args, {
         cwd,
         env: childEnv,
-        detached: process.platform !== "win32" && childEnv.GROK_COMPANION_BACKGROUND_WORKER !== "1",
+        detached: false,
         shell: false,
         windowsHide: true,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         stdio: ["ignore", "pipe", "pipe"]
       });
       let stdout = "";
@@ -591,6 +676,7 @@ export async function runGrokHeadless(options = {}) {
       let timer = null;
       let outputBytes = 0;
       const maxOutputBytes = options.maxOutputBytes ?? 32 * 1024 * 1024;
+      const childPids = [];
 
       const append = (current, chunk) => {
         outputBytes += Buffer.byteLength(chunk);
@@ -599,23 +685,65 @@ export async function runGrokHeadless(options = {}) {
         }
         return current + chunk.toString();
       };
+      const cleanupSignals = () => {
+        if (options.skipSignalHandlers) {
+          return;
+        }
+        process.off("SIGINT", onInterrupt);
+        process.off("SIGTERM", onInterrupt);
+      };
+      const terminateChild = () => {
+        try {
+          terminateProcessTree(child.pid, {
+            childPids,
+            platform: options.platform ?? process.platform
+          });
+        } catch {
+          // Preserve the original process or output failure.
+        }
+      };
       const fail = (error, terminate = true) => {
         if (settled) {
           return;
         }
         settled = true;
+        cleanupSignals();
         if (timer) {
           clearTimeout(timer);
         }
+        if (error && typeof error === "object" && Number.isInteger(child.pid)) {
+          error.pid = child.pid;
+        }
         if (terminate) {
-          try {
-            terminateProcessTree(child.pid);
-          } catch {
-            // Preserve the original process or output failure.
-          }
+          terminateChild();
+          // Wait for the child to exit so callers can assert the process was reaped.
+          const finish = () => reject(error);
+          let finished = false;
+          const done = () => {
+            if (finished) {
+              return;
+            }
+            finished = true;
+            finish();
+          };
+          child.once("close", done);
+          setTimeout(done, 2_000).unref?.();
+          return;
         }
         reject(error);
       };
+      const onInterrupt = (signal) => {
+        fail(new Error(`Grok interrupted by ${signal}.`), true);
+      };
+
+      if (!options.skipSignalHandlers) {
+        process.on("SIGINT", onInterrupt);
+        process.on("SIGTERM", onInterrupt);
+      }
+
+      if (Number.isInteger(child.pid) && child.pid > 0) {
+        childPids.push(child.pid);
+      }
 
       child.stdout.on("data", (chunk) => {
         try {
@@ -645,6 +773,7 @@ export async function runGrokHeadless(options = {}) {
       child.once("close", (code, signal) => {
         if (!settled) {
           settled = true;
+          cleanupSignals();
           clearTimeout(timer);
           streaming?.end();
           resolve({ exitCode: code ?? 1, signal, stdout, stderr, pid: child.pid ?? null });

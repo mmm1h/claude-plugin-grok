@@ -10,14 +10,22 @@ import {
   getConfig,
   listJobs,
   loadState,
+  readJobFile,
   resolveJobFile,
+  resolveJobsDir,
   resolveStateDir,
+  resolveStateFile,
   saveState,
   setConfig,
-  upsertJob
+  setStateLockTestHooks,
+  updateJobFile,
+  upsertJob,
+  writeJobFile
 } from "../plugins/grok/scripts/lib/state.mjs";
 import {
+  appendLogLine,
   createJobLogFile,
+  createJobProgressUpdater,
   createJobRecord,
   runTrackedJob
 } from "../plugins/grok/scripts/lib/tracked-jobs.mjs";
@@ -26,6 +34,23 @@ import {
   buildStatusSnapshot
 } from "../plugins/grok/scripts/lib/job-control.mjs";
 import { tempDir } from "./helpers.mjs";
+
+function withCompanionHome(t) {
+  const root = tempDir();
+  const stateHome = path.join(root, "state");
+  const previous = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = stateHome;
+  t.after(() => {
+    setStateLockTestHooks(null);
+    if (previous === undefined) {
+      delete process.env.GROK_COMPANION_HOME;
+    } else {
+      process.env.GROK_COMPANION_HOME = previous;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { root, stateHome };
+}
 
 test("atomic JSON writes retry transient Windows rename locks", (t) => {
   const root = tempDir();
@@ -239,4 +264,279 @@ test("concurrent state writers retain every job", async (t) => {
   for (let index = 0; index < 8; index += 1) {
     assert.ok(ids.has(`parallel-${index}`));
   }
+});
+
+test("withStateLock recovers a stale lock and times out on a fresh lock", (t) => {
+  const { root } = withCompanionHome(t);
+  const stateDir = resolveStateDir(root);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const lockFile = path.join(stateDir, ".state.lock");
+
+  fs.writeFileSync(lockFile, "dead-holder\n999999\n0\n", "utf8");
+  const staleTime = Date.now() - 60_000;
+  fs.utimesSync(lockFile, new Date(staleTime / 1000), new Date(staleTime / 1000));
+  setStateLockTestHooks({
+    isProcessAlive: () => false,
+    sleepSync() {}
+  });
+  upsertJob(root, { id: "after-stale-lock", status: "queued" });
+  assert.equal(listJobs(root).some((job) => job.id === "after-stale-lock"), true);
+  assert.equal(fs.existsSync(lockFile), false);
+
+  fs.writeFileSync(lockFile, `fresh-holder\n${process.pid}\n${Date.now()}\n`, "utf8");
+  const sleeps = [];
+  let virtualNow = 1_000_000;
+  setStateLockTestHooks({
+    lockTimeoutMs: 80,
+    staleLockMs: 30_000,
+    isProcessAlive: () => true,
+    sleepSync(ms) {
+      sleeps.push(ms);
+      // Advance the virtual clock only after a wait, so the first loop still sleeps.
+      virtualNow += ms;
+    },
+    nowMs: () => virtualNow
+  });
+  assert.throws(
+    () => upsertJob(root, { id: "blocked-by-fresh-lock", status: "queued" }),
+    /Timed out waiting for Grok companion state lock/
+  );
+  assert.ok(sleeps.length >= 1);
+  assert.ok(sleeps.every((ms) => ms >= 20));
+  // Sleep delays should grow (exponential backoff) for successive waits.
+  if (sleeps.length >= 2) {
+    assert.ok(sleeps[1] >= sleeps[0]);
+  }
+  fs.unlinkSync(lockFile);
+});
+test("runTrackedJob keeps cancelled status when the runner finishes or throws", async (t) => {
+  const { root } = withCompanionHome(t);
+
+  const completedJob = createJobRecord({
+    id: "task-cancel-race-complete",
+    kind: "task",
+    title: "Task",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "cancel-vs-complete"
+  }, { env: {} });
+  const completedLog = createJobLogFile(root, completedJob.id, completedJob.title);
+  const completedExecution = await runTrackedJob(completedJob, async () => {
+    writeJobFile(root, completedJob.id, {
+      ...completedJob,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      cancelledAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      exitCode: 130
+    });
+    return {
+      exitCode: 0,
+      durationMs: 10,
+      payload: { rawOutput: "should-not-win" },
+      rendered: "should-not-win\n"
+    };
+  }, { logPath: completedLog });
+  assert.equal(completedExecution.exitCode, 130);
+  assert.equal(completedExecution.cancelled, true);
+  const completedStored = readJobFile(resolveJobFile(root, completedJob.id));
+  assert.equal(completedStored.status, "cancelled");
+  assert.equal(completedStored.exitCode, 130);
+  assert.notEqual(completedStored.result?.rawOutput, "should-not-win");
+
+  const failedJob = createJobRecord({
+    id: "task-cancel-race-fail",
+    kind: "task",
+    title: "Task",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "cancel-vs-fail"
+  }, { env: {} });
+  const failedLog = createJobLogFile(root, failedJob.id, failedJob.title);
+  const failedExecution = await runTrackedJob(failedJob, async () => {
+    writeJobFile(root, failedJob.id, {
+      ...failedJob,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      cancelledAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      exitCode: 130
+    });
+    throw new Error("boom after cancel");
+  }, { logPath: failedLog });
+  assert.equal(failedExecution.exitCode, 130);
+  assert.equal(failedExecution.cancelled, true);
+  const failedStored = readJobFile(resolveJobFile(root, failedJob.id));
+  assert.equal(failedStored.status, "cancelled");
+  assert.equal(failedStored.exitCode, 130);
+  assert.notEqual(failedStored.errorMessage, "boom after cancel");
+});
+
+test("loadState with corrupt JSON does not prune existing job files", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-survives-corrupt-state";
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Keep me",
+    status: "running",
+    phase: "tool",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "important",
+    createdAt: new Date().toISOString()
+  });
+  upsertJob(root, { id: jobId, status: "running", summary: "important" });
+
+  const jobFile = resolveJobFile(root, jobId);
+  const logPath = path.join(resolveJobsDir(root), `${jobId}.log`);
+  fs.writeFileSync(logPath, "log body\n", "utf8");
+  assert.equal(fs.existsSync(jobFile), true);
+
+  fs.writeFileSync(resolveStateFile(root), "{ not valid json", "utf8");
+  const recovered = loadState(root);
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.equal(fs.existsSync(logPath), true);
+  assert.equal(recovered.jobs.some((job) => job.id === jobId), true);
+
+  // A subsequent index write must not wipe the real job after a corrupt read path.
+  upsertJob(root, { id: "task-new-after-corrupt", status: "queued" });
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.equal(listJobs(root).some((job) => job.id === jobId), true);
+  assert.ok(fs.readdirSync(path.dirname(resolveStateFile(root))).some((name) => name.includes("state.json.corrupt")));
+});
+
+test("writeJobFile rejects non-terminal overwrites of cancelled jobs", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-cas-terminal";
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "CAS",
+    status: "running",
+    phase: "running",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "cas",
+    createdAt: new Date().toISOString()
+  });
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "CAS",
+    status: "cancelled",
+    phase: "cancelled",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "cas",
+    exitCode: 130,
+    cancelledAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "CAS",
+    status: "running",
+    phase: "tool",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "cas",
+    progress: { message: "stale progress" }
+  });
+  const stored = readJobFile(resolveJobFile(root, jobId));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.exitCode, 130);
+  assert.equal(stored.progress, undefined);
+
+  writeJobFile(root, jobId, {
+    ...stored,
+    status: "completed",
+    phase: "completed",
+    exitCode: 0,
+    result: { rawOutput: "nope" }
+  });
+  assert.equal(readJobFile(resolveJobFile(root, jobId)).status, "cancelled");
+});
+
+test("progress updater skips silent events and only patches active jobs", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-progress-throttle";
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Progress",
+    status: "running",
+    phase: "starting",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "progress",
+    createdAt: new Date().toISOString()
+  });
+  const update = createJobProgressUpdater({ workspaceRoot: root, jobId });
+  update({ eventType: "thought", suppressProgress: true, message: "thinking", phase: "thinking" });
+  update({ eventType: "text", message: "token", phase: "text" });
+  assert.equal(readJobFile(resolveJobFile(root, jobId)).phase, "starting");
+
+  update({ eventType: "tool_use", message: "tool", phase: "tool", sessionId: "sess-1" });
+  const afterTool = readJobFile(resolveJobFile(root, jobId));
+  assert.equal(afterTool.phase, "tool");
+  assert.equal(afterTool.sessionId, "sess-1");
+  assert.equal(afterTool.sessionConfirmed, true);
+
+  writeJobFile(root, jobId, {
+    ...afterTool,
+    status: "cancelled",
+    phase: "cancelled",
+    exitCode: 130,
+    cancelledAt: new Date().toISOString(),
+    completedAt: new Date().toISOString()
+  });
+  update({ eventType: "tool_use", message: "late", phase: "tool" });
+  assert.equal(readJobFile(resolveJobFile(root, jobId)).status, "cancelled");
+});
+
+test("appendLogLine swallows I/O errors without throwing", (t) => {
+  const root = tempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // Path under a file (not a directory) forces appendFileSync to fail.
+  const blocker = path.join(root, "not-a-dir");
+  fs.writeFileSync(blocker, "x", "utf8");
+  assert.doesNotThrow(() => appendLogLine(path.join(blocker, "job.log"), "hello"));
+});
+
+test("readJobFile returns a corrupt marker instead of throwing on bad JSON", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-corrupt-json";
+  const file = resolveJobFile(root, jobId);
+  fs.writeFileSync(file, "{broken", "utf8");
+  const stored = readJobFile(file);
+  assert.equal(stored.corrupt, true);
+  assert.equal(stored.phase, "corrupt");
+  assert.match(stored.errorMessage, /corrupt/i);
+});
+
+test("updateJobFile mutator can skip when status is no longer active", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-update-skip";
+  writeJobFile(root, jobId, {
+    id: jobId,
+    kind: "task",
+    title: "Skip",
+    status: "completed",
+    phase: "completed",
+    cwd: root,
+    workspaceRoot: root,
+    summary: "skip",
+    createdAt: new Date().toISOString()
+  });
+  const result = updateJobFile(root, jobId, (latest) => ({
+    ...latest,
+    status: "running",
+    phase: "tool"
+  }));
+  assert.equal(result.status, "completed");
+  assert.equal(readJobFile(resolveJobFile(root, jobId)).status, "completed");
 });
