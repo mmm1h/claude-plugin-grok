@@ -304,18 +304,30 @@ test("streaming event normalization tolerates future event shapes", () => {
   assert.equal(textEvent.suppressProgress, true);
 });
 
+const AUTH_SENTINEL = "SENTINEL_SECRET_VALUE";
+
+function assertAuthConfiguredWithoutLeak(auth, expectedSource) {
+  assert.equal(auth.status, "configured");
+  assert.equal(auth.source, expectedSource);
+  assert.equal(auth.loggedIn, true);
+  assert.equal(auth.authUnverified, false);
+  assert.equal(isGrokAuthReady(auth), true);
+  assert.doesNotMatch(JSON.stringify(auth), new RegExp(AUTH_SENTINEL));
+}
+
 test("getGrokAuthStatus avoids a probe and reports local evidence", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // A1: empty home + empty env → needs_login
   const empty = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
   assert.equal(empty.status, "needs_login");
   assert.equal(empty.authUnverified, false);
-  fs.writeFileSync(path.join(dir, "config.toml"), "[model]\n", "utf8");
+  // A2: config.toml present but no credential keys → needs_login
+  fs.writeFileSync(path.join(dir, "config.toml"), '[cli]\ninstaller = "internal"\n', "utf8");
   const configOnly = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
   assert.equal(configOnly.status, "needs_login");
   assert.equal(configOnly.authUnverified, true);
   assert.equal(configOnly.source, "config.toml");
-  assert.equal(getGrokAuthStatus(dir, { grokHome: dir, env: { GROK_API_KEY: "present" } }).status, "configured");
 });
 
 test("config-only auth is not ready (prevents setup false-green)", (t) => {
@@ -335,25 +347,61 @@ test("config-only auth is not ready (prevents setup false-green)", (t) => {
   assert.equal(isGrokAuthReady({ status: "configured", authUnverified: true }), false);
 });
 
-test("auth ready with credential file only", (t) => {
+test("empty auth.json is not credential evidence", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(dir, "auth.json"), '{"token":"file-secret-value-xyz"}\n', "utf8");
+  // A3: zero-byte auth.json must not count as configured
+  fs.writeFileSync(path.join(dir, "auth.json"), "", "utf8");
   const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
-  assert.equal(auth.status, "configured");
-  assert.equal(auth.loggedIn, true);
-  assert.equal(auth.authUnverified, false);
-  assert.equal(auth.source, "auth.json");
-  assert.equal(isGrokAuthReady(auth), true);
-  assert.equal(auth.status !== "needs_login", true);
-  const serialized = JSON.stringify(auth);
-  assert.doesNotMatch(serialized, /file-secret-value-xyz/);
+  assert.equal(auth.status, "needs_login");
+  assert.equal(isGrokAuthReady(auth), false);
+});
+
+test("auth ready from GROK_API_KEY env (value not leaked)", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // B4
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { GROK_API_KEY: AUTH_SENTINEL }
+  });
+  assertAuthConfiguredWithoutLeak(auth, "GROK_API_KEY");
+});
+
+test("auth ready from XAI_API_KEY env (value not leaked)", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // B5
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { XAI_API_KEY: AUTH_SENTINEL }
+  });
+  assertAuthConfiguredWithoutLeak(auth, "XAI_API_KEY");
+});
+
+test("auth ready for each recognized credential file name", (t) => {
+  // C6–C11: each login artifact alone is enough
+  const names = [
+    "credentials.json",
+    "auth.json",
+    "oauth.json",
+    "tokens.json",
+    "api_key",
+    "api-key"
+  ];
+  for (const name of names) {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dir, name), `{"token":"${AUTH_SENTINEL}"}\n`, "utf8");
+    const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+    assertAuthConfiguredWithoutLeak(auth, name);
+  }
 });
 
 test("auth ready when config env_key env var is set", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const secret = "tpk-secret-value-must-never-leak-12345";
+  // D12
   fs.writeFileSync(
     path.join(dir, "config.toml"),
     [
@@ -368,23 +416,40 @@ test("auth ready when config env_key env var is set", (t) => {
   );
   const auth = getGrokAuthStatus(dir, {
     grokHome: dir,
-    env: { GROK_THIRD_PARTY_API_KEY: secret }
+    env: { GROK_THIRD_PARTY_API_KEY: AUTH_SENTINEL }
   });
-  assert.equal(auth.status, "configured");
-  assert.equal(auth.loggedIn, true);
-  assert.equal(auth.authUnverified, false);
-  assert.equal(auth.source, "env");
+  assertAuthConfiguredWithoutLeak(auth, "env");
   assert.match(auth.detail, /GROK_THIRD_PARTY_API_KEY/);
-  assert.equal(isGrokAuthReady(auth), true);
-  assert.equal(auth.status !== "needs_login", true);
-  const serialized = JSON.stringify(auth);
-  assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.doesNotMatch(serialized, /tpk-secret/);
+});
+
+test("auth needs_login when config env_key env var is empty string", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // D13: empty string is not a credential
+  fs.writeFileSync(
+    path.join(dir, "config.toml"),
+    [
+      '[model."grok-4.5"]',
+      'env_key = "MY_GATEWAY_KEY"',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { MY_GATEWAY_KEY: "" }
+  });
+  assert.equal(auth.status, "needs_login");
+  assert.equal(auth.loggedIn, false);
+  assert.equal(auth.authUnverified, true);
+  assert.equal(auth.source, "config.toml");
+  assert.equal(isGrokAuthReady(auth), false);
 });
 
 test("auth needs_login when config env_key env var is missing", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // D14
   fs.writeFileSync(
     path.join(dir, "config.toml"),
     [
@@ -403,17 +468,58 @@ test("auth needs_login when config env_key env var is missing", (t) => {
   assert.equal(auth.status !== "needs_login", false);
 });
 
+test("auth ready when one of multiple config env_key vars is set", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // D15: any non-empty env_key match is enough
+  fs.writeFileSync(
+    path.join(dir, "config.toml"),
+    [
+      '[model."primary"]',
+      'env_key = "MISSING_GATEWAY_KEY"',
+      "",
+      '[model."fallback"]',
+      'env_key = "MY_GATEWAY_KEY"',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { MY_GATEWAY_KEY: AUTH_SENTINEL }
+  });
+  assertAuthConfiguredWithoutLeak(auth, "env");
+  assert.match(auth.detail, /MY_GATEWAY_KEY/);
+});
+
 test("auth ready when config.toml has inline api_key (value not leaked)", (t) => {
   const dir = tempDir();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const secret = "inline-api-key-secret-do-not-leak";
-  fs.writeFileSync(path.join(dir, "config.toml"), `api_key = "${secret}"\n`, "utf8");
+  // E16
+  fs.writeFileSync(path.join(dir, "config.toml"), `api_key = "${AUTH_SENTINEL}"\n`, "utf8");
   const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
-  assert.equal(auth.status, "configured");
-  assert.equal(auth.source, "config.toml");
-  assert.equal(isGrokAuthReady(auth), true);
-  const serialized = JSON.stringify(auth);
-  assert.doesNotMatch(serialized, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assertAuthConfiguredWithoutLeak(auth, "config.toml");
+});
+
+test("credential file takes priority over config env_key", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // F17: local login file wins over env_key-backed env
+  fs.writeFileSync(path.join(dir, "auth.json"), `{"token":"${AUTH_SENTINEL}"}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(dir, "config.toml"),
+    [
+      '[model."grok-4.5"]',
+      'env_key = "MY_GATEWAY_KEY"',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  const auth = getGrokAuthStatus(dir, {
+    grokHome: dir,
+    env: { MY_GATEWAY_KEY: AUTH_SENTINEL }
+  });
+  assertAuthConfiguredWithoutLeak(auth, "auth.json");
 });
 
 test("optional auth probe can confirm or reject without defaulting on", (t) => {
