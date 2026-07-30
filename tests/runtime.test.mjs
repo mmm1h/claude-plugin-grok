@@ -989,6 +989,8 @@ test("usage lists new commands and task resume flags", (t) => {
   assert.match(response.stdout, /--stop-review/);
   assert.match(response.stdout, /--timeout-ms/);
   assert.match(response.stdout, /\blogs\b/);
+  assert.match(response.stdout, /\bps\b/);
+  assert.match(response.stdout, /--pid/);
   assert.match(response.stdout, /\bcleanup\b/);
   assert.match(response.stdout, /\bexport\b/);
   assert.match(response.stdout, /\brerun\b/);

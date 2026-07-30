@@ -485,3 +485,96 @@ export function renderRerunReport(payload) {
     ""
   ].filter((value) => value !== null).join("\n");
 }
+
+function processDecisionLabel(decision) {
+  switch (decision) {
+    case "do-not-kill":
+      return "ACTIVE — do not kill";
+    case "orphan-reclaimable":
+      return "ORPHAN — reclaimable via status/cancel";
+    case "unknown-not-managed":
+      return "NOT MANAGED by this plugin";
+    case "ambiguous":
+      return "AMBIGUOUS — inspect before acting";
+    default:
+      return String(decision ?? "unknown");
+  }
+}
+
+function renderProcessRow(entry) {
+  return [
+    `- pid ${entry.pid ?? "?"} · ${entry.jobId ?? "?"} · ${entry.kind ?? "?"} · ${entry.status ?? "?"}`,
+    `  decision: ${processDecisionLabel(entry.decision)}`,
+    entry.advice ? `  advice: ${entry.advice}` : null,
+    `  claudeSession: ${entry.claudeSessionId ?? "(none)"}`,
+    `  workspace: ${entry.workspaceRoot ?? "(unknown)"}`,
+    `  started: ${entry.startedAt ?? entry.createdAt ?? "(unknown)"}`,
+    entry.alive != null ? `  alive: ${yesNo(entry.alive)}` : null,
+    entry.match && entry.match !== "exact" ? `  match: ${entry.match}` : null
+  ].filter((value) => value !== null).join("\n");
+}
+
+export function renderProcessListReport(snapshot) {
+  const lines = [
+    "# Grok companion processes (all workspaces)",
+    "",
+    `State root: ${snapshot.stateRoot ?? ""}`,
+    `Buckets scanned: ${snapshot.scannedBuckets ?? 0}`,
+    `Tracked processes: ${snapshot.processCount ?? snapshot.processes?.length ?? 0}`,
+    ""
+  ];
+  if (!snapshot.processes?.length) {
+    lines.push("No active companion-managed processes found.");
+  } else {
+    for (const entry of snapshot.processes) {
+      lines.push(renderProcessRow(entry), "");
+    }
+  }
+  if (snapshot.errors?.length) {
+    lines.push("## Bucket errors", "");
+    for (const error of snapshot.errors) {
+      lines.push(`- ${error.bucketId}: ${error.error}`);
+    }
+    lines.push("");
+  }
+  if (snapshot.limitations?.length) {
+    lines.push("## Limits", "");
+    for (const item of snapshot.limitations) {
+      lines.push(`- ${item}`);
+    }
+    lines.push("");
+  }
+  lines.push("Reverse lookup: `/grok:ps --pid <pid>`. Prefer `/grok:cancel <job-id>` over raw kill.");
+  lines.push("");
+  return lines.join("\n");
+}
+
+export function renderProcessLookupReport(snapshot) {
+  const lines = [
+    `# Process lookup: PID ${snapshot.pid}`,
+    "",
+    `Managed by companion: ${yesNo(snapshot.managed)}`,
+    `Alive: ${yesNo(snapshot.alive)}`,
+    `Decision: ${processDecisionLabel(snapshot.decision)}`,
+    snapshot.advice ? `Advice: ${snapshot.advice}` : null,
+    `State root: ${snapshot.stateRoot ?? ""}`,
+    `Buckets scanned: ${snapshot.scannedBuckets ?? 0}`,
+    ""
+  ].filter((value) => value !== null);
+
+  if (snapshot.matches?.length) {
+    lines.push("## Matches", "");
+    for (const entry of snapshot.matches) {
+      lines.push(renderProcessRow(entry), "");
+    }
+  }
+
+  if (snapshot.limitations?.length) {
+    lines.push("## Limits", "");
+    for (const item of snapshot.limitations) {
+      lines.push(`- ${item}`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}\n`;
+}

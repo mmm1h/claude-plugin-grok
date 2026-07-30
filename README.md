@@ -39,7 +39,7 @@ Use only the marketplace and plugin names above. After reload, stop and summariz
 | Review / adversarial | Read-only structured review |
 | Rescue / task | Write-capable or read-only delegated work |
 | Transfer | Lossy Claude→Grok transcript handoff |
-| Jobs | status · result · logs · cancel · export · cleanup · rerun |
+| Jobs | status · ps · result · logs · cancel · export · cleanup · rerun |
 | Setup | Offline readiness + optional stop-review gate |
 
 CLI help: `node plugins/grok/scripts/grok-companion.mjs --help`
@@ -54,6 +54,7 @@ CLI help: `node plugins/grok/scripts/grok-companion.mjs --help`
 | `/grok:rescue` | Delegate via `grok:grok-rescue` → `task` | `--wait`/`--background`, `--resume`/`--fresh`, `--read-only`, `--model`, `--effort`, `--timeout-ms`, `--prompt-file`, `--session-id`, `--resume-job` |
 | `/grok:transfer` | Lossy handoff (not native import) | `--background`, `--source <jsonl>`, `--timeout-ms`, `--json` |
 | `/grok:status` | Running / latest finished / recent | `[job-id]`, `--all`, `--kind`, `--status`, `--limit`, `--progress-lines`, `--wait`, `--with-result`, `--timeout-ms` |
+| `/grok:ps` | All-workspace managed processes / PID lookup | `--pid <pid>`, `--include-terminal`, `--json` |
 | `/grok:result` | Full stored finished output | `[job-id]`, `--wait`, `--timeout-ms`, `--json` |
 | `/grok:logs` | Tail job log (default 80) | `[job-id]`, `--tail N`, `--json` |
 | `/grok:cancel` | Kill active job process tree | `[job-id]`, `--all`, `--kind`, `--json` |
@@ -68,6 +69,17 @@ Rescue: `--background`/`--wait` stay Claude-side; `--resume` → companion `--re
 - **Delegate** multi-file work, long diagnosis, research, post-review fixes → `/grok:rescue` (skill `delegate-to-grok`)
 - **Review** local git → `/grok:review` / `/grok:adversarial-review` (not free-text rescue)
 - **Small one-file edits** → do in Claude; skip Grok
+
+### Never run the grok CLI directly
+
+Always use this plugin. Companion already handles:
+
+- stdin via Node `stdio: ["ignore","pipe","pipe"]` (Git Bash `< /dev/null` is unreliable for Windows-native `grok`)
+- required flags (`--no-memory`, `--verbatim`, approve/sandbox, `--permission-mode`, `--session-id`)
+- Windows `.exe` / `.cmd` spawn without `shell:true`
+- job tracking, cancel tree-kill, logs, results, and `/grok:ps` ownership checks
+
+Suspect a stray process? `/grok:ps` or `/grok:ps --pid <pid>` before any kill.
 
 **Background jobs:** start `--background` → `/grok:status <id> --wait --with-result` or `/grok:result <id> --wait` → live `/grok:logs` → stop `/grok:cancel` → export then `/grok:cleanup --dry-run` before prune.
 

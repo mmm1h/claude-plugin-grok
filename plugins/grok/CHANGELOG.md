@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 - 2026-07-30
+
+### Features
+
+- Added `/grok:ps` (`grok-companion.mjs ps`) for **cross-workspace** process
+  attribution: lists every active companion-managed PID under the state root
+  (all repo buckets), with job id, kind, status, Claude session, workspace,
+  start time, liveness, and an explicit decision (`do-not-kill` /
+  `orphan-reclaimable` / `unknown-not-managed` / `ambiguous`).
+- `ps --pid <pid>` reverse-lookup answers whether a PID is managed and safe to
+  terminate. Prefer `/grok:cancel <job-id>` over raw kill.
+
+### Documentation
+
+- `delegate-to-grok` description and body, plus README, now tell agents to
+  **always** use this plugin and never invoke the bare `grok` CLI (stdin,
+  flags, Windows spawn, and job tracking differences).
+
 ## 0.5.2 - 2026-07-30
 
 ### Fixes

@@ -32,6 +32,7 @@ test("all public commands exist with basic Claude Code frontmatter", () => {
     "cleanup.md",
     "export.md",
     "logs.md",
+    "ps.md",
     "rerun.md",
     "rescue.md",
     "result.md",
@@ -83,6 +84,24 @@ test("manifests and hooks identify a valid grok plugin", () => {
   assert.ok(hooks.hooks.SessionStart);
   assert.ok(hooks.hooks.SessionEnd);
   assert.ok(hooks.hooks.Stop);
+});
+
+test("delegate-to-grok description and body discourage bare grok CLI", () => {
+  const skill = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "delegate-to-grok", "SKILL.md"), "utf8");
+  // Description is what Claude sees in the skill list before loading the body.
+  assert.match(skill, /Always call Grok through this plugin's commands; never run the grok CLI directly/);
+  assert.match(skill, /## Never call the grok CLI directly/);
+  assert.match(skill, /stdio:\s*\["ignore"/);
+  assert.match(skill, /--no-memory/);
+  assert.match(skill, /\/grok:ps/);
+});
+
+test("ps command documents cross-workspace ownership lookup", () => {
+  const source = fs.readFileSync(path.join(commandDir, "ps.md"), "utf8");
+  assert.match(source, /description:.*process/i);
+  assert.match(source, /--pid/);
+  assert.match(source, /do-not-kill|ACTIVE/);
+  assert.match(source, /CLAUDE_PLUGIN_ROOT/);
 });
 
 test("runtime contains no forbidden Codex app-server or package dependency", () => {

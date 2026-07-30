@@ -24,6 +24,8 @@ import {
   runGrokHeadless
 } from "./lib/grok.mjs";
 import {
+  buildProcessListSnapshot,
+  buildProcessLookupSnapshot,
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   cancelTrackedJob,
@@ -48,6 +50,8 @@ import {
   renderExportReport,
   renderJobStatusReport,
   renderLogsReport,
+  renderProcessListReport,
+  renderProcessLookupReport,
   renderQueuedLaunch,
   renderRerunReport,
   renderReviewResult,
@@ -112,6 +116,7 @@ function usage() {
     "  grok-companion.mjs status [job-id] [--all] [--kind <kind>] [--status <status>] [--limit N]",
     "                     [--progress-lines N] [--wait] [--with-result] [--timeout-ms <ms>]",
     "                     [--poll-interval-ms <ms>] [--json]",
+    "  grok-companion.mjs ps [--pid <pid>] [--include-terminal] [--json]",
     "  grok-companion.mjs result [job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
     "  grok-companion.mjs cancel [job-id] [--all] [--kind <kind>] [--json]",
     "  grok-companion.mjs logs [job-id] [--tail N] [--json]",
@@ -902,6 +907,22 @@ async function handleStatus(argv) {
   output(snapshot, renderStatusReport(snapshot), options.json);
 }
 
+function handlePs(argv) {
+  const { options } = commandInput(argv, {
+    valueOptions: ["pid"],
+    booleanOptions: ["json", "include-terminal"]
+  });
+  if (options.pid != null) {
+    const snapshot = buildProcessLookupSnapshot(options.pid);
+    output(snapshot, renderProcessLookupReport(snapshot), options.json);
+    return;
+  }
+  const snapshot = buildProcessListSnapshot({
+    includeTerminal: Boolean(options["include-terminal"])
+  });
+  output(snapshot, renderProcessListReport(snapshot), options.json);
+}
+
 async function handleResult(argv) {
   const { options, positionals } = commandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -1169,6 +1190,9 @@ async function main() {
       break;
     case "status":
       await handleStatus(argv);
+      break;
+    case "ps":
+      handlePs(argv);
       break;
     case "result":
       await handleResult(argv);

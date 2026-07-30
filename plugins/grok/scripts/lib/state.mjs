@@ -75,6 +75,96 @@ export function resolveStateRoot() {
   return process.env.GROK_COMPANION_HOME || path.join(os.homedir(), ".claude", "grok-companion");
 }
 
+/**
+ * Enumerate every companion state bucket under the state root (cross-workspace).
+ * A bucket is a directory that contains state.json and/or a jobs/ directory.
+ */
+export function listStateBuckets(options = {}) {
+  const root = options.stateRoot ?? resolveStateRoot();
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+  let names;
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const buckets = [];
+  for (const name of names) {
+    const stateDir = path.join(root, name);
+    try {
+      if (!fs.statSync(stateDir).isDirectory()) {
+        continue;
+      }
+      const hasState = fs.existsSync(path.join(stateDir, STATE_FILE_NAME));
+      const hasJobs = fs.existsSync(path.join(stateDir, JOBS_DIR_NAME));
+      if (!hasState && !hasJobs) {
+        continue;
+      }
+      buckets.push({
+        bucketId: name,
+        stateDir
+      });
+    } catch {
+      // Unreadable entry — skip.
+    }
+  }
+  return buckets.sort((left, right) => left.bucketId.localeCompare(right.bucketId));
+}
+
+/**
+ * Load the job index from an absolute state bucket directory (not a workspace cwd).
+ * Prefers state.json; rebuilds from jobs/*.json when the index is missing or corrupt.
+ */
+export function listJobsInStateDir(stateDir) {
+  if (!stateDir) {
+    return [];
+  }
+  const stateFile = path.join(stateDir, STATE_FILE_NAME);
+  if (fs.existsSync(stateFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      if (Array.isArray(parsed?.jobs)) {
+        return parsed.jobs;
+      }
+    } catch {
+      // Fall through to job-file rebuild.
+    }
+  }
+  const jobsDir = path.join(stateDir, JOBS_DIR_NAME);
+  if (!fs.existsSync(jobsDir)) {
+    return [];
+  }
+  const jobs = [];
+  for (const name of fs.readdirSync(jobsDir)) {
+    if (!name.endsWith(".json") || name.endsWith(".rerun.json")) {
+      continue;
+    }
+    const filePath = path.join(jobsDir, name);
+    try {
+      const job = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      if (job && typeof job === "object" && job.id) {
+        jobs.push(indexSummaryFromJobRecord(job, filePath));
+      }
+    } catch {
+      // Skip corrupt job files.
+    }
+  }
+  return pruneJobs(jobs);
+}
+
+/**
+ * Read a full job record from a state bucket by job id.
+ */
+export function readJobFileInStateDir(stateDir, jobId) {
+  if (!stateDir || !jobId) {
+    return null;
+  }
+  const file = path.join(stateDir, JOBS_DIR_NAME, `${jobId}.json`);
+  return readJobFileUnlocked(file);
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonical = workspaceRoot;

@@ -542,11 +542,19 @@ export function isProcessAlive(pid, options = {}) {
   return processIdentityMatches(identity, options);
 }
 
-function collectDescendantPids(pid, options = {}) {
+/**
+ * Collect descendant PIDs (POSIX via pgrep -P).
+ * On Windows returns [] — tree kill uses taskkill /T instead of walking children.
+ * Exported for process-attribution (ps) on platforms where the walk is cheap.
+ */
+export function collectDescendantPids(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   // Windows uses taskkill /T for tree kill; PowerShell CIM walks are too slow for
   // the hot timeout path (must stay well under a second under concurrent load).
   if (platform === "win32") {
+    return [];
+  }
+  if (!Number.isInteger(pid) || pid <= 0) {
     return [];
   }
   const run = options.runCommandImpl ?? runCommand;
@@ -574,6 +582,104 @@ function collectDescendantPids(pid, options = {}) {
     }
   }
   return descendants;
+}
+
+/**
+ * Best-effort parent PID. Returns null when the process is gone or PPID is unreadable.
+ */
+export function getProcessParentPid(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  const platform = options.platform ?? process.platform;
+  const run = options.runCommandImpl ?? runCommand;
+
+  if (platform === "win32") {
+    const ps = run(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ParentProcessId)`
+      ],
+      { cwd: options.cwd, env: options.env, shell: false }
+    );
+    if (!ps.error && ps.status === 0 && ps.stdout.trim()) {
+      const parent = Number.parseInt(ps.stdout.trim(), 10);
+      if (Number.isInteger(parent) && parent > 0) {
+        return parent;
+      }
+    }
+    const wmic = run(
+      "wmic",
+      ["process", "where", `ProcessId=${pid}`, "get", "ParentProcessId", "/format:value"],
+      { cwd: options.cwd, env: options.env, shell: false }
+    );
+    if (!wmic.error && wmic.status === 0) {
+      const match = String(wmic.stdout).match(/ParentProcessId\s*=\s*(\d+)/i);
+      if (match) {
+        const parent = Number.parseInt(match[1], 10);
+        if (Number.isInteger(parent) && parent > 0) {
+          return parent;
+        }
+      }
+    }
+    return null;
+  }
+
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm may contain spaces/parens; PPID is the 4th field after the closing ')'.
+    const close = stat.lastIndexOf(")");
+    if (close !== -1) {
+      const rest = stat.slice(close + 1).trim().split(/\s+/);
+      // fields after comm: state, ppid, ...
+      const parent = Number.parseInt(rest[1], 10);
+      if (Number.isInteger(parent) && parent > 0) {
+        return parent;
+      }
+    }
+  } catch {
+    // /proc unavailable — fall through to ps.
+  }
+
+  const ps = run("ps", ["-o", "ppid=", "-p", String(pid)], {
+    cwd: options.cwd,
+    env: options.env,
+    shell: false
+  });
+  if (!ps.error && ps.status === 0 && ps.stdout.trim()) {
+    const parent = Number.parseInt(ps.stdout.trim(), 10);
+    if (Number.isInteger(parent) && parent > 0) {
+      return parent;
+    }
+  }
+  return null;
+}
+
+/**
+ * Walk parent chain starting at pid (inclusive). Stops on cycle, missing parent, or maxDepth.
+ */
+export function listProcessAncestors(pid, options = {}) {
+  const maxDepth = options.maxDepth ?? 32;
+  const chain = [];
+  const seen = new Set();
+  let current = pid;
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    if (!Number.isInteger(current) || current <= 0 || seen.has(current)) {
+      break;
+    }
+    seen.add(current);
+    chain.push(current);
+    const parent = typeof options.getParentPidImpl === "function"
+      ? options.getParentPidImpl(current, options)
+      : getProcessParentPid(current, options);
+    if (parent == null || parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return chain;
 }
 
 function tryKill(kill, pid, signal) {

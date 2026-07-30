@@ -23,6 +23,7 @@ The companion CLI supports these commands. The rescue forwarder may call **only*
 | `task-resume-candidate` | Resume candidate probe (parent command only) |
 | `transfer` | Lossy Claude→Grok transcript handoff |
 | `status` | Job list / single-job status; optional `--wait` / `--with-result` |
+| `ps` | Cross-workspace process list / PID lookup (`--pid`, `--include-terminal`) |
 | `result` | Stored finished output; optional `--wait` |
 | `cancel` | Cancel active job(s); optional `--all` / `--kind` |
 | `logs` | Tail job log file |
@@ -42,7 +43,7 @@ task [--background] [--write|--read-only] [--resume-last|--resume|--fresh]
 Forwarder rules:
 
 - Invoke `task` exactly once and return stdout unchanged.
-- Do not call setup, review, adversarial-review, transfer, status, result, cancel, logs, cleanup, export, or rerun.
+- Do not call setup, review, adversarial-review, transfer, status, ps, result, cancel, logs, cleanup, export, or rerun.
 - Strip Claude execution flags `--background` and `--wait` (Claude-side only).
 - Map `--resume` to `--resume-last`; strip `--fresh`.
 - Pass through when present: `--model`, `--effort`, `--timeout-ms`, `--prompt-file`, `--read-only`, `--session-id`, `--resume-job`, `--json`.

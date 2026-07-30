@@ -3,15 +3,24 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { isProcessAlive, terminateProcessTree } from "./process.mjs";
+import {
+  collectDescendantPids,
+  isProcessAlive,
+  listProcessAncestors,
+  terminateProcessTree
+} from "./process.mjs";
 import {
   getConfig,
   listJobs,
+  listJobsInStateDir,
+  listStateBuckets,
   readJobFile,
+  readJobFileInStateDir,
   readJobRerunPayload,
   resolveJobFile,
   resolveJobLogFile,
   resolveJobRerunFile,
+  resolveStateRoot,
   updateState,
   upsertJob,
   writeJobFile,
@@ -686,6 +695,261 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
     throw new Error(`No job found for "${reference}". Run /grok:status to list known jobs.`);
   }
   return { workspaceRoot, job: enrichJob(selected, { maxProgressLines: options.maxProgressLines }) };
+}
+
+const ACTIVE_PROCESS_STATUSES = new Set(["queued", "running"]);
+
+/**
+ * Decision labels for process attribution (ps command).
+ * Agents should treat only "orphan-reclaimable" as safe to clean up via companion cancel/status.
+ */
+export const PROCESS_DECISION = {
+  DO_NOT_KILL: "do-not-kill",
+  ORPHAN_RECLAIMABLE: "orphan-reclaimable",
+  UNKNOWN_NOT_MANAGED: "unknown-not-managed",
+  AMBIGUOUS: "ambiguous"
+};
+
+function decisionForManagedProcess(entry) {
+  if (entry.alive && ACTIVE_PROCESS_STATUSES.has(entry.status)) {
+    return {
+      decision: PROCESS_DECISION.DO_NOT_KILL,
+      advice: "Active companion job — do not kill. Use /grok:cancel <job-id> if you must stop it."
+    };
+  }
+  if (!entry.alive && ACTIVE_PROCESS_STATUSES.has(entry.status)) {
+    return {
+      decision: PROCESS_DECISION.ORPHAN_RECLAIMABLE,
+      advice: "Tracked PID is dead while job is still active — orphan; reclaim via /grok:status (auto-reconcile) or /grok:cancel."
+    };
+  }
+  return {
+    decision: PROCESS_DECISION.DO_NOT_KILL,
+    advice: "Process is recorded for a terminal job history row; do not treat as a live kill target."
+  };
+}
+
+function processMatchKind(pid, jobPid, options = {}) {
+  if (pid === jobPid) {
+    return "exact";
+  }
+  const descendants = typeof options.collectDescendantsImpl === "function"
+    ? options.collectDescendantsImpl(jobPid, options)
+    : collectDescendantPids(jobPid, options);
+  if (descendants.includes(pid)) {
+    return "descendant";
+  }
+  const ancestors = typeof options.listAncestorsImpl === "function"
+    ? options.listAncestorsImpl(pid, options)
+    : listProcessAncestors(pid, options);
+  // ancestors[0] is pid itself; if jobPid appears later, job is an ancestor of the query pid.
+  if (ancestors.slice(1).includes(jobPid)) {
+    return "descendant";
+  }
+  return null;
+}
+
+function summarizeProcessEntry(job, bucket, options = {}) {
+  const aliveImpl = options.isProcessAliveImpl ?? isProcessAlive;
+  const pid = Number.isInteger(job.pid) && job.pid > 0 ? job.pid : null;
+  const alive = pid != null ? Boolean(aliveImpl(pid, options)) : false;
+  const base = {
+    pid,
+    jobId: job.id,
+    kind: job.kind ?? null,
+    status: job.status ?? null,
+    phase: job.phase ?? job.status ?? null,
+    title: job.title ?? null,
+    summary: job.summary ?? null,
+    claudeSessionId: job.claudeSessionId ?? null,
+    workspaceRoot: job.workspaceRoot ?? null,
+    cwd: job.cwd ?? null,
+    stateDir: bucket.stateDir,
+    bucketId: bucket.bucketId,
+    startedAt: job.startedAt ?? null,
+    createdAt: job.createdAt ?? null,
+    updatedAt: job.updatedAt ?? null,
+    alive,
+    match: "exact"
+  };
+  const { decision, advice } = decisionForManagedProcess(base);
+  return { ...base, decision, advice };
+}
+
+/**
+ * List every active (queued/running) process tracked by this plugin across all workspaces.
+ * Optionally include terminal jobs that still have a pid recorded (usually empty after finalize).
+ */
+export function buildProcessListSnapshot(options = {}) {
+  const stateRoot = options.stateRoot ?? resolveStateRoot();
+  const includeTerminal = Boolean(options.includeTerminal);
+  const buckets = typeof options.listBucketsImpl === "function"
+    ? options.listBucketsImpl({ stateRoot })
+    : listStateBuckets({ stateRoot });
+  const processes = [];
+  const errors = [];
+
+  for (const bucket of buckets) {
+    let jobs;
+    try {
+      jobs = typeof options.listJobsImpl === "function"
+        ? options.listJobsImpl(bucket.stateDir)
+        : listJobsInStateDir(bucket.stateDir);
+    } catch (error) {
+      errors.push({
+        bucketId: bucket.bucketId,
+        stateDir: bucket.stateDir,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      continue;
+    }
+    for (const job of jobs) {
+      const pid = Number.isInteger(job.pid) && job.pid > 0 ? job.pid : null;
+      if (pid == null) {
+        continue;
+      }
+      const active = ACTIVE_PROCESS_STATUSES.has(job.status);
+      if (!active && !includeTerminal) {
+        continue;
+      }
+      // Prefer full job file when present (richer fields).
+      let record = job;
+      try {
+        const full = typeof options.readJobImpl === "function"
+          ? options.readJobImpl(bucket.stateDir, job.id)
+          : readJobFileInStateDir(bucket.stateDir, job.id);
+        if (full && !full.corrupt) {
+          record = { ...job, ...full };
+        }
+      } catch {
+        // Keep index row.
+      }
+      processes.push(summarizeProcessEntry(record, bucket, options));
+    }
+  }
+
+  processes.sort((left, right) => {
+    const leftKey = String(left.updatedAt ?? left.startedAt ?? left.createdAt ?? "");
+    const rightKey = String(right.updatedAt ?? right.startedAt ?? right.createdAt ?? "");
+    return rightKey.localeCompare(leftKey);
+  });
+
+  return {
+    stateRoot,
+    scannedBuckets: buckets.length,
+    processCount: processes.length,
+    processes,
+    errors: errors.length > 0 ? errors : undefined,
+    limitations: [
+      "Attribution is based on companion job records under the state root, not OS process tags.",
+      "Only the job-worker PID is stored; nested grok children may match only via parent/descendant walk (best-effort; empty on Windows).",
+      "PID reuse can make a dead job's pid number reappear on an unrelated process — prefer job id + /grok:cancel over raw kill.",
+      "Bare grok CLI processes started outside this plugin are never listed."
+    ]
+  };
+}
+
+/**
+ * Reverse lookup: is this PID managed by the companion, and is it safe to terminate?
+ */
+export function buildProcessLookupSnapshot(pid, options = {}) {
+  const targetPid = Number.parseInt(String(pid ?? ""), 10);
+  if (!Number.isInteger(targetPid) || targetPid <= 0) {
+    throw new Error("`ps --pid` requires a positive integer PID.");
+  }
+
+  const list = buildProcessListSnapshot({ ...options, includeTerminal: true });
+  const matches = [];
+
+  for (const entry of list.processes) {
+    if (entry.pid == null) {
+      continue;
+    }
+    if (entry.pid === targetPid) {
+      matches.push({ ...entry, match: "exact" });
+      continue;
+    }
+    // Only walk trees for active jobs — terminal rows with stale pids must not claim descendants.
+    if (!ACTIVE_PROCESS_STATUSES.has(entry.status)) {
+      continue;
+    }
+    const match = processMatchKind(targetPid, entry.pid, options);
+    if (match) {
+      matches.push({
+        ...entry,
+        match,
+        queryPid: targetPid,
+        managedPid: entry.pid
+      });
+    }
+  }
+
+  // Deduplicate by jobId+match, prefer exact.
+  const byJob = new Map();
+  for (const match of matches) {
+    const key = match.jobId;
+    const existing = byJob.get(key);
+    if (!existing || (match.match === "exact" && existing.match !== "exact")) {
+      byJob.set(key, match);
+    }
+  }
+  const unique = [...byJob.values()];
+
+  const processAlive = typeof options.isProcessAliveImpl === "function"
+    ? Boolean(options.isProcessAliveImpl(targetPid, options))
+    : isProcessAlive(targetPid, options);
+
+  if (unique.length === 0) {
+    return {
+      pid: targetPid,
+      managed: false,
+      alive: processAlive,
+      decision: PROCESS_DECISION.UNKNOWN_NOT_MANAGED,
+      advice: processAlive
+        ? "Not tracked by this plugin. Do not assume it is a Grok companion orphan — it may be another Claude session's job, a manual grok CLI, or an unrelated process."
+        : "PID is not alive and is not in companion job records.",
+      matches: [],
+      stateRoot: list.stateRoot,
+      scannedBuckets: list.scannedBuckets,
+      limitations: list.limitations
+    };
+  }
+
+  if (unique.length > 1) {
+    return {
+      pid: targetPid,
+      managed: true,
+      alive: processAlive,
+      decision: PROCESS_DECISION.AMBIGUOUS,
+      advice: "Multiple companion jobs claim this PID (or its tree). Inspect matches; do not kill until you identify the intended job.",
+      matches: unique,
+      stateRoot: list.stateRoot,
+      scannedBuckets: list.scannedBuckets,
+      limitations: list.limitations
+    };
+  }
+
+  const only = unique[0];
+  const { decision, advice } = decisionForManagedProcess(only);
+  // Descendant of a live worker: still do-not-kill.
+  const finalDecision = only.match === "descendant" && only.alive
+    ? PROCESS_DECISION.DO_NOT_KILL
+    : decision;
+  const finalAdvice = only.match === "descendant" && only.alive
+    ? `Descendant of active companion job ${only.jobId} (worker pid ${only.pid}) — do not kill. Use /grok:cancel ${only.jobId}.`
+    : advice;
+
+  return {
+    pid: targetPid,
+    managed: true,
+    alive: processAlive,
+    decision: finalDecision,
+    advice: finalAdvice,
+    matches: [{ ...only, decision: finalDecision, advice: finalAdvice }],
+    stateRoot: list.stateRoot,
+    scannedBuckets: list.scannedBuckets,
+    limitations: list.limitations
+  };
 }
 
 export function resolveResultJob(cwd, reference, options = {}) {

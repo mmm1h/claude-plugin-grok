@@ -7,6 +7,7 @@ description: >
   the user asks for Grok / rescue / background Grok. Prefer /grok:review or
   /grok:adversarial-review for local-git reviews. Skip for trivial one-file
   edits, pure chat, or tasks that need Claude-only live session context.
+  Always call Grok through this plugin's commands; never run the grok CLI directly.
 user-invocable: true
 ---
 
@@ -46,6 +47,24 @@ Claude orchestrates (decide → hand off → verify). Prefer slash commands.
 | Transcript handoff | `/grok:transfer` |
 
 Rescue is subagent `grok:grok-rescue` (slash or `Agent`), not a skill. Never `Skill(grok:grok-rescue)`.
+
+## Never call the grok CLI directly
+
+Always use this plugin (`/grok:rescue`, `/grok:review`, companion `task`, etc.).
+Bare `grok` / Bash around the CLI fails in ways companion already fixes:
+
+1. **stdin** — companion uses Node `stdio: ["ignore","pipe","pipe"]`; shell
+   `< /dev/null` does not map reliably to Windows-native binaries under Git Bash.
+2. **flags** — companion always passes `--no-memory`, `--verbatim`,
+   `--always-approve` / sandbox flags, `--permission-mode bypassPermissions`,
+   and a stable `--session-id`.
+3. **Windows spawn** — resolves `.exe` vs npm `.cmd` shims without `shell:true`
+   so prompts never become shell metacharacters.
+4. **jobs** — tracks pid, background, cancel tree-kill, logs, result retention,
+   and cross-workspace attribution (`/grok:ps`).
+
+If a process looks like a stray Grok, run `/grok:ps` or `/grok:ps --pid <pid>`
+before killing anything.
 
 ## Handoff shape
 

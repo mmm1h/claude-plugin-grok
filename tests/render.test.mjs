@@ -7,6 +7,8 @@ import {
   renderExportReport,
   renderJobStatusReport,
   renderLogsReport,
+  renderProcessListReport,
+  renderProcessLookupReport,
   renderRerunReport,
   renderSetupReport,
   renderStatusReport,
@@ -296,4 +298,44 @@ test("logs cleanup export rerun and bulk cancel renderers produce readable repor
       { jobId: "b", status: "cancelled", method: "taskkill" }
     ]
   }), /Cancelled 2 of 2/);
+});
+
+test("process list and lookup renderers surface decisions agents can act on", () => {
+  const list = renderProcessListReport({
+    stateRoot: "C:\\state",
+    scannedBuckets: 2,
+    processCount: 1,
+    processes: [{
+      pid: 1234,
+      jobId: "task-1",
+      kind: "task",
+      status: "running",
+      decision: "do-not-kill",
+      advice: "Active companion job — do not kill.",
+      claudeSessionId: "sess-1",
+      workspaceRoot: "C:\\repo",
+      startedAt: "2026-07-30T00:00:00.000Z",
+      alive: true
+    }],
+    limitations: ["Attribution is job-record based."]
+  });
+  assert.match(list, /Grok companion processes/);
+  assert.match(list, /ACTIVE — do not kill/);
+  assert.match(list, /task-1/);
+  assert.match(list, /\/grok:ps --pid/);
+
+  const lookup = renderProcessLookupReport({
+    pid: 99,
+    managed: false,
+    alive: true,
+    decision: "unknown-not-managed",
+    advice: "Not tracked by this plugin.",
+    matches: [],
+    stateRoot: "C:\\state",
+    scannedBuckets: 1,
+    limitations: ["Bare grok CLI never listed."]
+  });
+  assert.match(lookup, /Process lookup: PID 99/);
+  assert.match(lookup, /NOT MANAGED/);
+  assert.match(lookup, /Not tracked/);
 });
