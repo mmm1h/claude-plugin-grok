@@ -1,6 +1,6 @@
 ---
 description: Show active and recent Grok jobs for this repository
-argument-hint: '[job-id] [--all] [--kind <kind>] [--status <status>] [--limit N] [--progress-lines N] [--wait] [--with-result] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]'
+argument-hint: '[job-id] [--all] [--kind <kind>] [--status <status>] [--limit N] [--progress-lines N] [--logs [N]] [--wait] [--with-result] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -22,6 +22,7 @@ Filters and options (list mode, no job ID unless noted):
 - `--status <status>` — filter by status (`queued`, `running`, `completed`, `failed`, `cancelled`, …)
 - `--limit N` — cap listed jobs (default 8 when `--all` is not set)
 - `--progress-lines N` — how many recent progress lines to attach per job (non-negative)
+- `--logs [N]` — print the job log tail instead of the status report (default **80** lines; job ID optional = newest job). Not combinable with `--wait` / `--with-result`
 - `--json` — structured JSON instead of Markdown tables
 
 Wait mode (requires a job ID):

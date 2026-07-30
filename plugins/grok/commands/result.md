@@ -1,6 +1,6 @@
 ---
 description: Show the stored final output for a finished Grok job in this repository
-argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]'
+argument-hint: '[job-id] [--wait] [--out <path>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -10,7 +10,7 @@ allowed-tools: Bash(node:*)
 Present the full output exactly as returned. Preserve job status, the complete Grok output, errors, Grok session ID, file references, and resume guidance. Do not summarize it.
 Preserve duration, exit code, last progress, session confirmation, resumability, and cancellation evidence when present.
 
-Without `--wait`:
+Without `--wait` and without `--out`:
 - Resolve a finished job (`completed` / `failed` / `cancelled`). Omit the job ID to use the latest finished job for this Claude session/workspace.
 - Active `queued`/`running` jobs error with a pointer to `/grok:status`.
 
@@ -20,6 +20,10 @@ With `--wait` (requires a job ID):
 - `--poll-interval-ms <ms>` sets the poll interval (default **1000**).
 - On success, print the full stored result.
 - On timeout, print the latest **status** snapshot (not a fake result) and exit code **124**.
+
+With `--out <path>` (requires a job ID; not combinable with `--wait`):
+- Write a portable JSON bundle (job record + full log text when present) to the given path.
+- Present the export path and whether the bundle includes the log.
 
 `--json` selects structured JSON.
 

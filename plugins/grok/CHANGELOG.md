@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0 - 2026-07-30
+
+### Breaking changes
+
+- **Slash command surface reduced from 13 to 9** (codex-plugin-cc parity + `ps`):
+  - **Removed** `/grok:export` → use `/grok:result [job-id] --out <path>`
+  - **Removed** `/grok:logs` → use `/grok:status [job-id] --logs [N]` (default tail 80)
+  - **Removed** `/grok:cleanup` slash command; companion subcommand
+    `grok-companion.mjs cleanup` remains for manual ops
+  - **Removed** `/grok:rerun` and the companion `rerun` subcommand entirely
+- **Rerun request sidecar removed** (`jobs/<id>.rerun.json` is no longer written
+  or read). Re-run failed work by starting a new task with a corrected prompt.
+- Bundle from `result --out` is job + log only (no rerun payload / `hasRerun`).
+
+### Features
+
+- `status --logs [N]` tails the job log (optional job id = newest job).
+- `result --out <path>` exports a portable JSON bundle (job record + log).
+
 ## 0.7.0 - 2026-07-30
 
 ### Breaking changes

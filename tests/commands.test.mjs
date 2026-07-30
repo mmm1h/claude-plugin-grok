@@ -29,11 +29,7 @@ test("all public commands exist with basic Claude Code frontmatter", () => {
   const expected = [
     "adversarial-review.md",
     "cancel.md",
-    "cleanup.md",
-    "export.md",
-    "logs.md",
     "ps.md",
-    "rerun.md",
     "rescue.md",
     "result.md",
     "review.md",

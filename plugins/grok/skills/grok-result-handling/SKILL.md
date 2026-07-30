@@ -39,30 +39,22 @@ user-invocable: false
 - `--with-result` requires `--wait` and a job ID. When the job finishes in time,
   present the full stored result (same content as `/grok:result`), not a
   condensed status line.
+- `/grok:status [job-id] --logs [N]` prints the job log tail (default **80**
+  lines) instead of the status report. Prefer this for live or historical
+  progress lines. Do not invent progress from memory when the log is available.
 
-## Result and logs
+## Result
 
 - `/grok:result` shows the full stored output for a finished job.
 - `/grok:result --wait` (job ID required) waits for completion, then prints the
   result; on timeout it prints a **status** snapshot (not a fabricated result)
   and exits **124**.
-- Prefer `/grok:logs <job-id>` for live or historical progress lines (default
-  tail 80). Do not invent progress from memory when the log command is available.
-
-## Lifecycle helpers
-
-- `/grok:export` writes a portable JSON bundle (job + log + rerun sidecar).
-  Present the path and `hasLog` / `hasRerun` facts.
-- `/grok:cleanup` deletes finished job artifacts only when `--older-than` and/or
-  `--keep` select them. Prefer reporting a prior `--dry-run` selection before
-  destructive cleanup. Active jobs are never removed.
-- `/grok:rerun` launches a **new** job from the saved request; it is not a
-  session resume unless the stored request already resumed one. Point the user
-  at the new job id for status/result/logs.
+- `/grok:result <job-id> --out <path>` writes a portable JSON bundle (job + log)
+  to the given path. Present the path and `hasLog` fact.
 
 ## Wait / timeout presentation
 
 - When a wait times out, say the job is still active (or report the snapshot
-  status) and preserve the job id for `/grok:status`, `/grok:logs`,
+  status) and preserve the job id for `/grok:status`, `/grok:status --logs`,
   `/grok:cancel`, or a longer `--timeout-ms` retry.
 - Do not claim success on exit code 124 or on `waitTimedOut: true`.

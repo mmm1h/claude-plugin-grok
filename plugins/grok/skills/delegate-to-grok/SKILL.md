@@ -42,7 +42,7 @@ Claude orchestrates (decide → hand off → verify). Prefer slash commands.
 | Read-only | `/grok:rescue --read-only …` |
 | Git review | `/grok:review --wait` (or `--background`) |
 | Design pressure-test | `/grok:adversarial-review …` |
-| Long job | `--background`, then status/result/logs |
+| Long job | `--background`, then status/result (`status --logs` for log tail) |
 | Continue / fresh | `--resume` / `--fresh` |
 | Transcript handoff | `/grok:transfer` |
 
@@ -82,9 +82,9 @@ Load `grok-prompting`. Envelope: `task`, `grounding_rules`, `constraints`,
 
 Follow `grok-result-handling`: present companion output as-is; background via
 `/grok:status <id> --wait --with-result` or `/grok:result <id> --wait`; exit
-**124** = still running (keep id); logs `/grok:logs`; cancel `/grok:cancel`;
-no auto-fix after review; trust `cancelled` only after delivery/exit;
-auth → `/grok:setup`.
+**124** = still running (keep id); log tail `/grok:status <id> --logs`; cancel
+`/grok:cancel`; no auto-fix after review; trust `cancelled` only after
+delivery/exit; auth → `/grok:setup`.
 
 ```text
 /grok:rescue --background implement docs/plan.md and run npm test

@@ -39,7 +39,7 @@ Use only the marketplace and plugin names above. After reload, stop and summariz
 | Review / adversarial | Read-only structured review |
 | Rescue / task | Write-capable or read-only delegated work |
 | Transfer | Lossy Claude→Grok transcript handoff |
-| Jobs | status · ps · result · logs · cancel · export · cleanup · rerun |
+| Jobs | status · ps · result · cancel |
 | Setup | Offline readiness + optional stop-review gate |
 
 CLI help: `node plugins/grok/scripts/grok-companion.mjs --help`
@@ -53,14 +53,12 @@ CLI help: `node plugins/grok/scripts/grok-companion.mjs --help`
 | `/grok:adversarial-review` | Review + free-form focus | same as review + focus text |
 | `/grok:rescue` | Delegate via `grok:grok-rescue` → `task` | `--wait`/`--background`, `--resume`/`--fresh`, `--read-only`, `--model`, `--effort`, `--timeout-ms`, `--prompt-file`, `--session-id`, `--resume-job` |
 | `/grok:transfer` | Lossy handoff (not native import) | `--background`, `--source <jsonl>`, `--timeout-ms`, `--json` |
-| `/grok:status` | Running / latest finished / recent | `[job-id]`, `--all`, `--kind`, `--status`, `--limit`, `--progress-lines`, `--wait`, `--with-result`, `--timeout-ms` |
+| `/grok:status` | Running / latest finished / recent; optional log tail | `[job-id]`, `--all`, `--kind`, `--status`, `--limit`, `--progress-lines`, `--logs [N]`, `--wait`, `--with-result`, `--timeout-ms` |
 | `/grok:ps` | All-workspace managed processes / PID lookup | `--pid <pid>`, `--include-terminal`, `--json` |
-| `/grok:result` | Full stored finished output | `[job-id]`, `--wait`, `--timeout-ms`, `--json` |
-| `/grok:logs` | Tail job log (default 80) | `[job-id]`, `--tail N`, `--json` |
+| `/grok:result` | Full stored finished output; optional export | `[job-id]`, `--wait`, `--out <path>`, `--timeout-ms`, `--json` |
 | `/grok:cancel` | Kill active job process tree | `[job-id]`, `--all` (current session), `--all-sessions`, `--kind`, `--json` |
-| `/grok:export` | Bundle job + log + rerun | `[job-id]`, `--out <path>` |
-| `/grok:cleanup` | Prune finished jobs only | `--older-than`, `--keep`, `--dry-run` |
-| `/grok:rerun` | New job from saved request | `[job-id]`, `--background` |
+
+Ops-only companion subcommands (no slash command): `cleanup` prunes finished jobs (`--older-than` / `--keep` / `--dry-run`).
 
 Rescue: `--background`/`--wait` stay Claude-side; `--resume` → companion `--resume-last`.
 
@@ -81,7 +79,7 @@ Always use this plugin. Companion already handles:
 
 Suspect a stray process? `/grok:ps` or `/grok:ps --pid <pid>` before any kill.
 
-**Background jobs:** start `--background` → `/grok:status <id> --wait --with-result` or `/grok:result <id> --wait` → live `/grok:logs` → stop `/grok:cancel` → export then `/grok:cleanup --dry-run` before prune.
+**Background jobs:** start `--background` → `/grok:status <id> --wait --with-result` or `/grok:result <id> --wait` → live `/grok:status <id> --logs` → stop `/grok:cancel`. Optional: `/grok:result <id> --out bundle.json` then companion `cleanup --dry-run` before prune.
 
 | Exit | Meaning |
 | --- | --- |

@@ -498,19 +498,8 @@ export function renderExportReport(payload) {
     `Exported job ${payload.jobId}.`,
     `Output: ${payload.outPath}`,
     `Includes log: ${yesNo(payload.hasLog)}.`,
-    `Includes rerun payload: ${yesNo(payload.hasRerun)}.`,
     ""
   ].join("\n");
-}
-
-export function renderRerunReport(payload) {
-  return [
-    `Reran job ${payload.sourceJobId} as ${payload.jobId}.`,
-    `Status: ${payload.status}.`,
-    payload.summary ? `Summary: ${payload.summary}` : null,
-    payload.logPath ? `Log: ${payload.logPath}` : null,
-    ""
-  ].filter((value) => value !== null).join("\n");
 }
 
 function processDecisionLabel(decision) {

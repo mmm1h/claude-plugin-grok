@@ -16,15 +16,12 @@ import {
   listStateBuckets,
   readJobFile,
   readJobFileInStateDir,
-  readJobRerunPayload,
   resolveJobFile,
   resolveJobLogFile,
-  resolveJobRerunFile,
   resolveStateRoot,
   updateState,
   upsertJob,
-  writeJobFile,
-  writeJobRerunPayload
+  writeJobFile
 } from "./state.mjs";
 import {
   appendLogLine,
@@ -153,29 +150,6 @@ export function enrichJob(job, options = {}) {
       : (formatDuration(job.durationMs) ?? duration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)),
     progressPreview: active || job.status === "failed" ? progressPreview(job.logPath, maxProgressLines) : []
   };
-}
-
-/**
- * Persist a minimal rerun sidecar so terminal jobs remain re-queueable even
- * though tracked-jobs strips `request` from the finished job record.
- */
-export function saveJobRerunSnapshot(workspaceRoot, job) {
-  if (!job?.id || !job?.request) {
-    return null;
-  }
-  return writeJobRerunPayload(workspaceRoot, job.id, {
-    kind: job.kind,
-    title: job.title,
-    summary: job.summary,
-    write: Boolean(job.write),
-    sessionId: job.sessionId ?? null,
-    sessionConfirmed: Boolean(job.sessionConfirmed),
-    request: job.request
-  });
-}
-
-export function loadJobRerunSnapshot(workspaceRoot, jobId) {
-  return readJobRerunPayload(workspaceRoot, jobId);
 }
 
 function persistJob(workspaceRoot, job) {
@@ -1132,13 +1106,11 @@ export function cleanupJobs(cwd, options = {}) {
   for (const job of selected) {
     const paths = {
       jobFile: resolveJobFile(workspaceRoot, job.id),
-      logFile: job.logPath || resolveJobLogFile(workspaceRoot, job.id),
-      rerunFile: resolveJobRerunFile(workspaceRoot, job.id)
+      logFile: job.logPath || resolveJobLogFile(workspaceRoot, job.id)
     };
     if (!dryRun) {
       unlinkIfExists(paths.jobFile);
       unlinkIfExists(paths.logFile);
-      unlinkIfExists(paths.rerunFile);
     }
     removed.push({
       id: job.id,
@@ -1167,7 +1139,8 @@ export function cleanupJobs(cwd, options = {}) {
 }
 
 /**
- * Bundle a finished (or any) job into a portable export directory / archive payload.
+ * Bundle a finished (or any) job into a portable JSON export (job + log).
+ * Used by `result --out`.
  */
 export function exportJobBundle(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -1178,25 +1151,15 @@ export function exportJobBundle(cwd, reference, options = {}) {
   }
   const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
   const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
-  const rerunPath = resolveJobRerunFile(workspaceRoot, selected.id);
   let logText = null;
   if (logPath && fs.existsSync(logPath)) {
     logText = fs.readFileSync(logPath, "utf8");
-  }
-  let rerun = null;
-  if (fs.existsSync(rerunPath)) {
-    try {
-      rerun = JSON.parse(fs.readFileSync(rerunPath, "utf8"));
-    } catch {
-      rerun = null;
-    }
   }
   const bundle = {
     exportedAt: nowIso(),
     workspaceRoot,
     job: stored,
-    log: logText,
-    rerun
+    log: logText
   };
 
   const outPath = options.out
@@ -1209,13 +1172,12 @@ export function exportJobBundle(cwd, reference, options = {}) {
     jobId: selected.id,
     outPath,
     bytes: Buffer.byteLength(JSON.stringify(bundle), "utf8"),
-    hasLog: logText != null,
-    hasRerun: rerun != null
+    hasLog: logText != null
   };
 }
 
 /**
- * Read job log lines (tail). Returns structured payload for the logs command.
+ * Read job log lines (tail). Used by `status --logs`.
  */
 export function readJobLogs(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -1226,7 +1188,7 @@ export function readJobLogs(cwd, reference, options = {}) {
   if (!selected) {
     throw new Error(reference
       ? `No job found for "${reference}".`
-      : "No Grok jobs found. Pass a job id to /grok:logs.");
+      : "No Grok jobs found. Pass a job id to status --logs.");
   }
   const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
   const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);

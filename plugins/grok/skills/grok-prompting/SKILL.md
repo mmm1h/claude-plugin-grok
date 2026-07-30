@@ -105,8 +105,8 @@ harder." Better evidence and completion rules are more useful than verbosity.
 ## Companion Contract
 
 - Assemble one prompt and invoke companion `task` exactly once.
-- Do not call `status`, `result`, `cancel`, `logs`, `cleanup`, `export`,
-  `rerun`, `transfer`, review commands, or setup from the forwarding agent.
+- Do not call `status`, `result`, `cancel`, `cleanup`, `transfer`, review
+  commands, or setup from the forwarding agent.
 - Do not poll a background job or manage its lifecycle inside this skill.
 - Pass through runtime flags the user supplied: `--timeout-ms`,
   `--prompt-file`, `--read-only`, `--model`, `--effort`, `--session-id`,

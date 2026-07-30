@@ -32,7 +32,6 @@ import {
   cancelTrackedJobsParallel,
   cleanupJobs,
   exportJobBundle,
-  loadJobRerunSnapshot,
   readJobLogs,
   readStoredJob,
   reconcileSessionJobs,
@@ -40,7 +39,6 @@ import {
   resolveCancelableJobs,
   resolveResultJob,
   resolveResumeTarget,
-  saveJobRerunSnapshot,
   WAIT_TIMEOUT_EXIT_CODE
 } from "./lib/job-control.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
@@ -53,7 +51,6 @@ import {
   renderProcessListReport,
   renderProcessLookupReport,
   renderQueuedLaunch,
-  renderRerunReport,
   renderReviewResult,
   renderSetupReport,
   renderStatusReport,
@@ -114,15 +111,12 @@ function usage() {
     "  grok-companion.mjs task-resume-candidate [--json]",
     "  grok-companion.mjs transfer [--background] [--source <claude-jsonl>] [--timeout-ms <ms>] [--json]",
     "  grok-companion.mjs status [job-id] [--all] [--kind <kind>] [--status <status>] [--limit N]",
-    "                     [--progress-lines N] [--wait] [--with-result] [--timeout-ms <ms>]",
+    "                     [--progress-lines N] [--logs [N]] [--wait] [--with-result] [--timeout-ms <ms>]",
     "                     [--poll-interval-ms <ms>] [--json]",
     "  grok-companion.mjs ps [--pid <pid>] [--include-terminal] [--json]",
-    "  grok-companion.mjs result [job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
+    "  grok-companion.mjs result [job-id] [--wait] [--out <path>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
     "  grok-companion.mjs cancel [job-id] [--all] [--all-sessions] [--kind <kind>] [--json]",
-    "  grok-companion.mjs logs [job-id] [--tail N] [--json]",
-    "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]",
-    "  grok-companion.mjs export <job-id> [--out <path>] [--json]",
-    "  grok-companion.mjs rerun [job-id] [--background] [--json]"
+    "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]"
   ].join("\n");
 }
 
@@ -583,8 +577,6 @@ function spawnWorker(cwd, jobId) {
 }
 
 function enqueue(job) {
-  // Sidecar before worker spawn so terminal strip of request still leaves a rerun path.
-  saveJobRerunSnapshot(job.workspaceRoot, job);
   const logPath = createJobLogFile(job.workspaceRoot, job.id, job.title);
   const queued = {
     ...job,
@@ -650,7 +642,6 @@ async function handleReview(argv, adversarial) {
     const payload = enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
@@ -747,7 +738,6 @@ async function handleTask(argv) {
     const payload = enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
@@ -811,7 +801,6 @@ async function handleTransfer(argv) {
     const payload = enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
@@ -834,8 +823,33 @@ async function waitForJob(cwd, reference, timeoutMs, options = {}) {
   };
 }
 
+/**
+ * Expand bare `--logs` to `--logs <default>` so parseArgs can treat it as a
+ * value option while still accepting an optional line count.
+ */
+function expandOptionalLogsFlag(argv, defaultTail = 80) {
+  const expanded = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--logs") {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith("-")) {
+        expanded.push("--logs", String(defaultTail));
+      } else {
+        expanded.push("--logs", next);
+        index += 1;
+      }
+      continue;
+    }
+    expanded.push(token);
+  }
+  return expanded;
+}
+
 async function handleStatus(argv) {
-  const { options, positionals } = commandInput(argv, {
+  // Normalize first so slash-command single-string argv sees `--logs` as a token,
+  // then expand bare `--logs` to `--logs 80` before value-option parsing.
+  const { options, positionals } = parseArgs(expandOptionalLogsFlag(normalizeArgv(argv)), {
     valueOptions: [
       "cwd",
       "timeout-ms",
@@ -843,9 +857,11 @@ async function handleStatus(argv) {
       "status",
       "limit",
       "progress-lines",
+      "logs",
       "poll-interval-ms"
     ],
-    booleanOptions: ["json", "all", "wait", "with-result"]
+    booleanOptions: ["json", "all", "wait", "with-result"],
+    aliasMap: { C: "cwd" }
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
@@ -861,6 +877,16 @@ async function handleStatus(argv) {
   const maxJobs = options.limit == null
     ? undefined
     : parsePositiveInt(options.limit, "--limit");
+
+  if (options.logs != null) {
+    if (options.wait || options["with-result"]) {
+      throw new Error("`status --logs` cannot be combined with --wait or --with-result.");
+    }
+    const tail = parseNonNegativeInt(options.logs, "--logs");
+    const payload = readJobLogs(cwd, reference, { tail });
+    output(payload, renderLogsReport(payload), options.json);
+    return;
+  }
 
   if (options.wait && !reference) {
     throw new Error("`status --wait` requires a job id.");
@@ -925,11 +951,24 @@ function handlePs(argv) {
 
 async function handleResult(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "out"],
     booleanOptions: ["json", "wait"]
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
+
+  if (options.out != null) {
+    if (options.wait) {
+      throw new Error("`result --out` cannot be combined with --wait.");
+    }
+    if (!reference) {
+      throw new Error("`result --out` requires a job id.");
+    }
+    const payload = exportJobBundle(cwd, reference, { out: options.out });
+    output(payload, renderExportReport(payload), options.json);
+    return;
+  }
+
   if (options.wait) {
     if (!reference) {
       throw new Error("`result --wait` requires a job id.");
@@ -1043,18 +1082,6 @@ async function handleCancel(argv) {
   }
 }
 
-function handleLogs(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "tail"],
-    booleanOptions: ["json"]
-  });
-  const cwd = commandCwd(options);
-  const reference = positionals[0] ?? "";
-  const tail = options.tail == null ? undefined : parseNonNegativeInt(options.tail, "--tail");
-  const payload = readJobLogs(cwd, reference, { tail });
-  output(payload, renderLogsReport(payload), options.json);
-}
-
 function handleCleanup(argv) {
   const { options } = commandInput(argv, {
     valueOptions: ["cwd", "older-than", "keep"],
@@ -1071,82 +1098,6 @@ function handleCleanup(argv) {
     dryRun: Boolean(options["dry-run"])
   });
   output(payload, renderCleanupReport(payload), options.json);
-}
-
-function handleExport(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "out"],
-    booleanOptions: ["json"]
-  });
-  const cwd = commandCwd(options);
-  const reference = positionals[0] ?? "";
-  if (!reference) {
-    throw new Error("`export` requires a job id.");
-  }
-  const payload = exportJobBundle(cwd, reference, { out: options.out ?? null });
-  output(payload, renderExportReport(payload), options.json);
-}
-
-async function handleRerun(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json", "background"]
-  });
-  const cwd = commandCwd(options);
-  requireAvailable(cwd);
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const reference = positionals[0] ?? "";
-  if (!reference) {
-    throw new Error("`rerun` requires a job id.");
-  }
-  // Prefer the explicit job reference; fall back to finished-job resolution for prefixes.
-  let sourceJob;
-  try {
-    const resolved = resolveResultJob(cwd, reference, { env: process.env, all: true });
-    sourceJob = readStoredJob(resolved.workspaceRoot, resolved.job.id) ?? resolved.job;
-  } catch {
-    const snapshot = buildSingleJobSnapshot(cwd, reference);
-    sourceJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id) ?? snapshot.job;
-  }
-  if (["queued", "running"].includes(sourceJob.status)) {
-    throw new Error(`Job ${sourceJob.id} is still ${sourceJob.status}; cancel it or wait before rerunning.`);
-  }
-
-  const sidecar = loadJobRerunSnapshot(workspaceRoot, sourceJob.id);
-  const request = sidecar?.request ?? sourceJob.request ?? null;
-  if (!request || typeof request !== "object") {
-    throw new Error(
-      `No rerun payload found for job ${sourceJob.id}. `
-      + "Jobs finished before this companion version, or pruned without a sidecar, cannot be rerun."
-    );
-  }
-
-  const kind = sidecar?.kind ?? sourceJob.kind ?? request.type ?? "task";
-  const title = `Rerun: ${sidecar?.title ?? sourceJob.title ?? kind}`;
-  const summary = sidecar?.summary ?? sourceJob.summary ?? shorten(request.prompt ?? title);
-  const write = sidecar?.write ?? sourceJob.write ?? Boolean(request.write);
-  // Fresh job id; do not resume the prior Grok session unless the stored request already did.
-  const job = makeJob({
-    cwd: request.cwd ?? workspaceRoot,
-    kind,
-    title,
-    summary,
-    write,
-    request: { ...request },
-    sessionId: request.sessionId ?? null,
-    sessionConfirmed: Boolean(request.sessionConfirmed)
-  });
-
-  if (options.background) {
-    const payload = {
-      ...enqueue(job),
-      sourceJobId: sourceJob.id
-    };
-    output(payload, renderRerunReport(payload), options.json);
-  } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
-    await runForeground(job, options.json);
-  }
 }
 
 async function handleWorker(argv) {
@@ -1221,17 +1172,8 @@ async function main() {
     case "cancel":
       await handleCancel(argv);
       break;
-    case "logs":
-      handleLogs(argv);
-      break;
     case "cleanup":
       handleCleanup(argv);
-      break;
-    case "export":
-      handleExport(argv);
-      break;
-    case "rerun":
-      await handleRerun(argv);
       break;
     case "job-worker":
       await handleWorker(argv);

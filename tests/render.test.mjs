@@ -9,7 +9,6 @@ import {
   renderLogsReport,
   renderProcessListReport,
   renderProcessLookupReport,
-  renderRerunReport,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
@@ -262,7 +261,7 @@ test("review renderer reports parse and shape failures with raw output", () => {
   assert.doesNotMatch(invalidShape, /No material findings/);
 });
 
-test("logs cleanup export rerun and bulk cancel renderers produce readable reports", () => {
+test("logs cleanup export and bulk cancel renderers produce readable reports", () => {
   assert.match(renderLogsReport({
     jobId: "task-1",
     logPath: "C:\\state\\task-1.log",
@@ -280,16 +279,8 @@ test("logs cleanup export rerun and bulk cancel renderers produce readable repor
   assert.match(renderExportReport({
     jobId: "task-1",
     outPath: "C:\\repo\\task-1.export.json",
-    hasLog: true,
-    hasRerun: true
-  }), /Includes rerun payload: yes/);
-  assert.match(renderRerunReport({
-    sourceJobId: "task-1",
-    jobId: "task-2",
-    status: "queued",
-    summary: "again",
-    logPath: "C:\\state\\task-2.log"
-  }), /Reran job task-1 as task-2/);
+    hasLog: true
+  }), /Includes log: yes/);
   assert.match(renderCancelReport({
     requestedCount: 2,
     cancelledCount: 2,

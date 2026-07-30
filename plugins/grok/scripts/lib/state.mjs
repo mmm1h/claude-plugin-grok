@@ -138,6 +138,7 @@ export function listJobsInStateDir(stateDir) {
   }
   const jobs = [];
   for (const name of fs.readdirSync(jobsDir)) {
+    // Skip leftover pre-0.8.0 rerun sidecars if present on disk.
     if (!name.endsWith(".json") || name.endsWith(".rerun.json")) {
       continue;
     }
@@ -235,7 +236,8 @@ function rebuildStateFromJobFiles(cwd) {
   }
   const jobs = [];
   for (const name of fs.readdirSync(jobsDir)) {
-    if (!name.endsWith(".json")) {
+    // Skip leftover pre-0.8.0 rerun sidecars if present on disk.
+    if (!name.endsWith(".json") || name.endsWith(".rerun.json")) {
       continue;
     }
     const filePath = path.join(jobsDir, name);
@@ -497,8 +499,7 @@ function saveStateUnlocked(cwd, state) {
     prunedIds.push(job.id);
     for (const target of [
       path.join(resolveJobsDir(cwd), `${job.id}.json`),
-      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`),
-      path.join(resolveJobsDir(cwd), `${job.id}.rerun.json`)
+      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`)
     ]) {
       try {
         if (fs.existsSync(target)) {
@@ -514,8 +515,8 @@ function saveStateUnlocked(cwd, state) {
     const more = prunedIds.length > 3 ? ` (+${prunedIds.length - 3} more)` : "";
     process.stderr.write(
       `[grok] Pruned ${prunedIds.length} old job(s) from the index (limit ${MAX_JOBS}): `
-      + `${sample}${more}. Export with /grok:export before retention drops them, `
-      + `or manage history with /grok:cleanup.\n`
+      + `${sample}${more}. Export with result --out before retention drops them, `
+      + `or manage history with companion cleanup.\n`
     );
   }
   return value;
@@ -571,41 +572,6 @@ export function resolveJobFile(cwd, jobId) {
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
-}
-
-/**
- * Sidecar path for rerun payloads. Terminal job records drop `request`
- * (tracked-jobs strips it); this file keeps a minimal copy for `/grok:rerun`.
- */
-export function resolveJobRerunFile(cwd, jobId) {
-  ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.rerun.json`);
-}
-
-export function writeJobRerunPayload(cwd, jobId, payload) {
-  ensureStateDir(cwd);
-  const file = resolveJobRerunFile(cwd, jobId);
-  writeJsonFileAtomic(file, {
-    version: 1,
-    jobId,
-    savedAt: nowIso(),
-    ...payload
-  });
-  return file;
-}
-
-export function readJobRerunPayload(cwd, jobId) {
-  const file = resolveJobRerunFile(cwd, jobId);
-  if (!fs.existsSync(file)) {
-    return null;
-  }
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[grok] Failed to parse rerun payload ${file}: ${message}\n`);
-    return null;
-  }
 }
 
 /**

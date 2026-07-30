@@ -1,6 +1,6 @@
 {
   "name": "claude-plugin-grok",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Use the local Grok CLI from Claude Code for reviews, delegated tasks, transfers, and background jobs.",
