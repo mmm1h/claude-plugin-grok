@@ -991,14 +991,58 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 
 /**
  * Resolve every active job eligible for bulk cancel.
- * Defaults to the current Claude session unless options.all is set.
+ *
+ * Scope rules (destructive — intentionally stricter than status --all):
+ * - Default / --all with a Claude session id: only that session's jobs
+ * - --all-sessions: every active job in the workspace
+ * - No Claude session id (hookless / direct CLI): cannot isolate ownership,
+ *   so the workspace-wide active set is returned with scope "no-session-id"
+ *   so callers can warn the user instead of silently acting as "all sessions"
+ *
+ * options.allSessions (boolean) selects cross-session bulk cancel.
+ * options.all is ignored here; cancel bulk always goes through this helper
+ * and session isolation is the default when a session id is present.
  */
 export function resolveCancelableJobs(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const active = sortJobsNewestFirst(listJobs(workspaceRoot))
     .filter((job) => ["queued", "running"].includes(job.status));
-  const scoped = applyJobFilters(filterCurrentSession(active, options), options);
-  return { workspaceRoot, jobs: scoped };
+  const sessionId = currentClaudeSession(options);
+  const allSessions = Boolean(options.allSessions);
+
+  let jobs;
+  let scope;
+  if (allSessions) {
+    jobs = applyJobFilters(active, options);
+    scope = "all-sessions";
+  } else if (sessionId) {
+    jobs = applyJobFilters(
+      active.filter((job) => job.claudeSessionId === sessionId),
+      options
+    );
+    scope = "current-session";
+  } else {
+    jobs = applyJobFilters(active, options);
+    scope = "no-session-id";
+  }
+
+  const otherSessionJobs = sessionId
+    ? jobs
+      .filter((job) => job.claudeSessionId !== sessionId)
+      .map((job) => ({
+        jobId: job.id,
+        claudeSessionId: job.claudeSessionId ?? null
+      }))
+    : [];
+
+  return {
+    workspaceRoot,
+    jobs,
+    scope,
+    claudeSessionId: sessionId,
+    otherSessionCount: otherSessionJobs.length,
+    otherSessionJobs
+  };
 }
 
 function parseDurationToMs(value) {

@@ -400,15 +400,42 @@ export function renderStoredJobResult(storedJob) {
 export function renderCancelReport(payload) {
   if (payload.results) {
     const lines = [
-      `Cancelled ${payload.cancelledCount ?? 0} of ${payload.requestedCount ?? payload.results.length} Grok job(s).`,
-      ""
+      `Cancelled ${payload.cancelledCount ?? 0} of ${payload.requestedCount ?? payload.results.length} Grok job(s).`
     ];
+    if (payload.scope === "no-session-id") {
+      lines.push(
+        "Note: No Claude session id (GROK_COMPANION_CLAUDE_SESSION_ID); bulk cancel scoped to the entire workspace."
+      );
+    } else if (payload.scope === "all-sessions") {
+      lines.push(
+        `Scope: all Claude sessions in this workspace`
+        + (payload.otherSessionCount
+          ? ` (${payload.otherSessionCount} from other sessions).`
+          : ".")
+      );
+    } else if (payload.scope === "current-session") {
+      lines.push(
+        `Scope: current Claude session`
+        + (payload.claudeSessionId ? ` (${payload.claudeSessionId}).` : ".")
+      );
+    }
+    lines.push("");
     for (const entry of payload.results) {
+      const sessionBit = entry.claudeSessionId
+        ? ` [session ${entry.claudeSessionId}${entry.otherSession ? ", other session" : ""}]`
+        : "";
       lines.push(
         `- ${entry.jobId}: ${entry.status}`
         + (entry.method ? ` via ${entry.method}` : "")
+        + sessionBit
         + (entry.errorMessage ? ` (${entry.errorMessage})` : "")
       );
+    }
+    if (payload.otherSessionCount > 0 && Array.isArray(payload.otherSessionJobs) && payload.otherSessionJobs.length > 0) {
+      lines.push("", `Other-session jobs in this cancel (${payload.otherSessionCount}):`);
+      for (const job of payload.otherSessionJobs) {
+        lines.push(`- ${job.jobId} (claudeSessionId: ${job.claudeSessionId ?? "(none)"})`);
+      }
     }
     lines.push("");
     return lines.join("\n");

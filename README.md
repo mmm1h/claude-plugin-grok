@@ -57,7 +57,7 @@ CLI help: `node plugins/grok/scripts/grok-companion.mjs --help`
 | `/grok:ps` | All-workspace managed processes / PID lookup | `--pid <pid>`, `--include-terminal`, `--json` |
 | `/grok:result` | Full stored finished output | `[job-id]`, `--wait`, `--timeout-ms`, `--json` |
 | `/grok:logs` | Tail job log (default 80) | `[job-id]`, `--tail N`, `--json` |
-| `/grok:cancel` | Kill active job process tree | `[job-id]`, `--all`, `--kind`, `--json` |
+| `/grok:cancel` | Kill active job process tree | `[job-id]`, `--all` (current session), `--all-sessions`, `--kind`, `--json` |
 | `/grok:export` | Bundle job + log + rerun | `[job-id]`, `--out <path>` |
 | `/grok:cleanup` | Prune finished jobs only | `--older-than`, `--keep`, `--dry-run` |
 | `/grok:rerun` | New job from saved request | `[job-id]`, `--background` |

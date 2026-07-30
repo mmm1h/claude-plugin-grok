@@ -298,6 +298,43 @@ test("logs cleanup export rerun and bulk cancel renderers produce readable repor
       { jobId: "b", status: "cancelled", method: "taskkill" }
     ]
   }), /Cancelled 2 of 2/);
+  const crossSession = renderCancelReport({
+    requestedCount: 2,
+    cancelledCount: 2,
+    scope: "all-sessions",
+    claudeSessionId: "sess-a",
+    otherSessionCount: 1,
+    otherSessionJobs: [{ jobId: "b", claudeSessionId: "sess-b" }],
+    results: [
+      {
+        jobId: "a",
+        status: "cancelled",
+        method: "taskkill",
+        claudeSessionId: "sess-a",
+        otherSession: false
+      },
+      {
+        jobId: "b",
+        status: "cancelled",
+        method: "taskkill",
+        claudeSessionId: "sess-b",
+        otherSession: true
+      }
+    ]
+  });
+  assert.match(crossSession, /all Claude sessions/);
+  assert.match(crossSession, /other session/);
+  assert.match(crossSession, /Other-session jobs/);
+  assert.match(crossSession, /sess-b/);
+  assert.match(renderCancelReport({
+    requestedCount: 1,
+    cancelledCount: 1,
+    scope: "no-session-id",
+    claudeSessionId: null,
+    otherSessionCount: 0,
+    otherSessionJobs: [],
+    results: [{ jobId: "a", status: "cancelled", method: "taskkill" }]
+  }), /No Claude session id/);
 });
 
 test("process list and lookup renderers surface decisions agents can act on", () => {

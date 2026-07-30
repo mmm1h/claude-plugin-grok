@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 - 2026-07-30
+
+### Breaking changes
+
+- **`cancel --all` is now session-scoped.** It cancels only active jobs for the
+  current Claude session (`GROK_COMPANION_CLAUDE_SESSION_ID`), not every active
+  job in the workspace. Previously `--all` cancelled across all sessions in the
+  same workspace, which could kill jobs owned by other Claude sessions.
+  Cross-session bulk cancel requires the new explicit flag `--all-sessions`.
+  When no session id is set (hookless / direct CLI), bulk cancel still covers
+  the workspace but reports `scope: "no-session-id"` so the broader effect is
+  never silent. `status --all` remains a read-only cross-session view.
+
+### Features
+
+- `cancel --all-sessions` cancels every active job in the workspace and reports
+  how many (and which) belong to other Claude sessions, including job id and
+  `claudeSessionId` in human and `--json` output.
+
 ## 0.6.0 - 2026-07-30
 
 ### Features

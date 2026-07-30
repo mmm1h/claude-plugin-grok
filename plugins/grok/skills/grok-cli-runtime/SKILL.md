@@ -25,7 +25,7 @@ The companion CLI supports these commands. The rescue forwarder may call **only*
 | `status` | Job list / single-job status; optional `--wait` / `--with-result` |
 | `ps` | Cross-workspace process list / PID lookup (`--pid`, `--include-terminal`) |
 | `result` | Stored finished output; optional `--wait` |
-| `cancel` | Cancel active job(s); optional `--all` / `--kind` |
+| `cancel` | Cancel active job(s); `--all` = current session, `--all-sessions` = workspace-wide, optional `--kind` |
 | `logs` | Tail job log file |
 | `cleanup` | Prune finished jobs (`--older-than` / `--keep` / `--dry-run`) |
 | `export` | Bundle job + log + rerun sidecar |

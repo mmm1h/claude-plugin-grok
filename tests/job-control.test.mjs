@@ -12,6 +12,7 @@ import {
   reconcileOrphanedJob,
   reconcileSessionJobs,
   resolveCancelableJob,
+  resolveCancelableJobs,
   resolveResultJob
 } from "../plugins/grok/scripts/lib/job-control.mjs";
 import { listJobs, readJobFile, resolveJobFile, saveState, writeJobFile } from "../plugins/grok/scripts/lib/state.mjs";
@@ -145,6 +146,52 @@ test("resolveCancelableJob errors with no active, multiple active, and missing i
 
   const single = resolveCancelableJob(repo, "task-one", { env });
   assert.equal(single.job.id, "task-one");
+});
+
+test("resolveCancelableJobs scopes --all to current session and --all-sessions across sessions", (t) => {
+  const { repo } = withStateHome(t);
+  seedJobs(repo, [
+    {
+      id: "task-a",
+      kind: "task",
+      status: "running",
+      phase: "tool",
+      claudeSessionId: "sess-a",
+      updatedAt: "2026-07-29T10:00:00.000Z"
+    },
+    {
+      id: "task-b",
+      kind: "task",
+      status: "queued",
+      phase: "queued",
+      claudeSessionId: "sess-b",
+      updatedAt: "2026-07-29T09:30:00.000Z"
+    }
+  ]);
+
+  const sessionScoped = resolveCancelableJobs(repo, {
+    env: { [CLAUDE_SESSION_ID_ENV]: "sess-a" }
+  });
+  assert.equal(sessionScoped.scope, "current-session");
+  assert.equal(sessionScoped.claudeSessionId, "sess-a");
+  assert.deepEqual(sessionScoped.jobs.map((job) => job.id), ["task-a"]);
+  assert.equal(sessionScoped.otherSessionCount, 0);
+
+  const allSessions = resolveCancelableJobs(repo, {
+    env: { [CLAUDE_SESSION_ID_ENV]: "sess-a" },
+    allSessions: true
+  });
+  assert.equal(allSessions.scope, "all-sessions");
+  assert.equal(allSessions.jobs.length, 2);
+  assert.equal(allSessions.otherSessionCount, 1);
+  assert.deepEqual(allSessions.otherSessionJobs, [
+    { jobId: "task-b", claudeSessionId: "sess-b" }
+  ]);
+
+  const noSession = resolveCancelableJobs(repo, { env: {} });
+  assert.equal(noSession.scope, "no-session-id");
+  assert.equal(noSession.claudeSessionId, null);
+  assert.equal(noSession.jobs.length, 2);
 });
 
 test("reconcileSessionJobs marks dead-PID orphans failed for the current session only", (t) => {

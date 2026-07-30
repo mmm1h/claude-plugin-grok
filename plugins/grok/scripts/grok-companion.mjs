@@ -118,7 +118,7 @@ function usage() {
     "                     [--poll-interval-ms <ms>] [--json]",
     "  grok-companion.mjs ps [--pid <pid>] [--include-terminal] [--json]",
     "  grok-companion.mjs result [job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
-    "  grok-companion.mjs cancel [job-id] [--all] [--kind <kind>] [--json]",
+    "  grok-companion.mjs cancel [job-id] [--all] [--all-sessions] [--kind <kind>] [--json]",
     "  grok-companion.mjs logs [job-id] [--tail N] [--json]",
     "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]",
     "  grok-companion.mjs export <job-id> [--out <path>] [--json]",
@@ -962,16 +962,25 @@ async function handleResult(argv) {
 async function handleCancel(argv) {
   const { options, positionals } = commandInput(argv, {
     valueOptions: ["cwd", "kind"],
-    booleanOptions: ["json", "all"]
+    booleanOptions: ["json", "all", "all-sessions"]
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
-  if (options.all) {
+  const allSessions = Boolean(options["all-sessions"]);
+  const bulk = Boolean(options.all) || allSessions;
+  if (bulk) {
     if (reference) {
-      throw new Error("Pass either a job id or --all, not both.");
+      throw new Error("Pass either a job id or --all/--all-sessions, not both.");
     }
-    const { workspaceRoot, jobs } = resolveCancelableJobs(cwd, {
-      all: true,
+    const {
+      workspaceRoot,
+      jobs,
+      scope,
+      claudeSessionId,
+      otherSessionCount,
+      otherSessionJobs
+    } = resolveCancelableJobs(cwd, {
+      allSessions,
       kind: options.kind ?? null,
       env: process.env
     });
@@ -980,21 +989,32 @@ async function handleCancel(argv) {
         ? `No active Grok jobs of kind "${options.kind}" to cancel.`
         : "No active Grok jobs to cancel.");
     }
+    const reason = allSessions ? "cancel --all-sessions" : "cancel --all";
     const results = await cancelTrackedJobsParallel(workspaceRoot, jobs, {
       env: process.env,
-      reason: "cancel --all"
+      reason
     });
     const payload = {
       requestedCount: jobs.length,
       cancelledCount: results.filter((entry) => entry.status === "cancelled").length,
-      results: results.map((entry, index) => ({
-        jobId: jobs[index].id,
-        previousStatus: entry.previousStatus,
-        status: entry.status,
-        delivered: entry.delivered,
-        method: entry.method,
-        errorMessage: entry.errorMessage
-      }))
+      scope,
+      claudeSessionId,
+      otherSessionCount,
+      otherSessionJobs,
+      results: results.map((entry, index) => {
+        const job = jobs[index];
+        const jobSession = job.claudeSessionId ?? null;
+        return {
+          jobId: job.id,
+          claudeSessionId: jobSession,
+          otherSession: Boolean(claudeSessionId && jobSession !== claudeSessionId),
+          previousStatus: entry.previousStatus,
+          status: entry.status,
+          delivered: entry.delivered,
+          method: entry.method,
+          errorMessage: entry.errorMessage
+        };
+      })
     };
     output(payload, renderCancelReport(payload), options.json);
     if (payload.cancelledCount !== payload.requestedCount) {
@@ -1010,6 +1030,7 @@ async function handleCancel(argv) {
   const cancellation = cancelTrackedJob(workspaceRoot, job, { env: process.env });
   const payload = {
     jobId: job.id,
+    claudeSessionId: job.claudeSessionId ?? null,
     previousStatus: cancellation.previousStatus,
     status: cancellation.status,
     delivered: cancellation.delivered,

@@ -909,6 +909,7 @@ test("status filters by kind/status/limit and cancel --all cancels active jobs",
   assert.ok(snapshot.jobs.every((job) => job.kind === "task" && job.status === "running"));
   assert.ok(snapshot.jobs.length <= 1);
 
+  // No session id: --all scopes to the whole workspace and reports no-session-id.
   const cancelled = runCompanion(["cancel", "--all", "--kind", "task", "--json", "--cwd", repo], {
     env,
     cwd: repo,
@@ -918,6 +919,134 @@ test("status filters by kind/status/limit and cancel --all cancels active jobs",
   const cancelPayload = JSON.parse(cancelled.stdout);
   assert.ok(cancelPayload.requestedCount >= 2);
   assert.equal(cancelPayload.cancelledCount, cancelPayload.requestedCount);
+  assert.equal(cancelPayload.scope, "no-session-id");
+});
+
+test("cancel --all is session-scoped; --all-sessions crosses sessions", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const envA = fakeGrokEnv(state, {
+    FAKE_GROK_DELAY_MS: "10000",
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-cancel-a"
+  });
+  const envB = fakeGrokEnv(state, {
+    FAKE_GROK_DELAY_MS: "10000",
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-cancel-b"
+  });
+
+  const launchedA = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "session a cancel scope"],
+    { env: envA, cwd: repo }
+  );
+  const launchedB = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "session b cancel scope"],
+    { env: envB, cwd: repo }
+  );
+  assert.equal(launchedA.status, 0, launchedA.stderr);
+  assert.equal(launchedB.status, 0, launchedB.stderr);
+  const idA = JSON.parse(launchedA.stdout).jobId;
+  const idB = JSON.parse(launchedB.stdout).jobId;
+  await waitForJob(repo, envA, idA, (job) => job.status === "running");
+  await waitForJob(repo, envB, idB, (job) => job.status === "running");
+
+  const cancelA = runCompanion(["cancel", "--all", "--json", "--cwd", repo], {
+    env: envA,
+    cwd: repo,
+    timeout: 30_000
+  });
+  assert.equal(cancelA.status, 0, cancelA.stderr);
+  const payloadA = JSON.parse(cancelA.stdout);
+  assert.equal(payloadA.scope, "current-session");
+  assert.equal(payloadA.claudeSessionId, "claude-cancel-a");
+  assert.equal(payloadA.otherSessionCount, 0);
+  assert.equal(payloadA.requestedCount, 1);
+  assert.equal(payloadA.cancelledCount, 1);
+  assert.equal(payloadA.results[0].jobId, idA);
+  assert.equal(payloadA.results[0].claudeSessionId, "claude-cancel-a");
+  assert.equal(payloadA.results[0].otherSession, false);
+
+  const stillB = runCompanion(["status", idB, "--json", "--cwd", repo], { env: envB, cwd: repo });
+  assert.equal(stillB.status, 0, stillB.stderr);
+  const jobB = JSON.parse(stillB.stdout).job;
+  assert.ok(["queued", "running"].includes(jobB.status), `expected B still active, got ${jobB.status}`);
+
+  const cancelAllSessions = runCompanion(["cancel", "--all-sessions", "--json", "--cwd", repo], {
+    env: envA,
+    cwd: repo,
+    timeout: 30_000
+  });
+  assert.equal(cancelAllSessions.status, 0, cancelAllSessions.stderr);
+  const payloadAll = JSON.parse(cancelAllSessions.stdout);
+  assert.equal(payloadAll.scope, "all-sessions");
+  assert.equal(payloadAll.claudeSessionId, "claude-cancel-a");
+  assert.equal(payloadAll.requestedCount, 1);
+  assert.equal(payloadAll.cancelledCount, 1);
+  assert.equal(payloadAll.otherSessionCount, 1);
+  assert.equal(payloadAll.otherSessionJobs.length, 1);
+  assert.equal(payloadAll.otherSessionJobs[0].jobId, idB);
+  assert.equal(payloadAll.otherSessionJobs[0].claudeSessionId, "claude-cancel-b");
+  assert.equal(payloadAll.results[0].jobId, idB);
+  assert.equal(payloadAll.results[0].claudeSessionId, "claude-cancel-b");
+  assert.equal(payloadAll.results[0].otherSession, true);
+
+  const doneB = runCompanion(["status", idB, "--json", "--cwd", repo], { env: envB, cwd: repo });
+  assert.equal(doneB.status, 0, doneB.stderr);
+  assert.equal(JSON.parse(doneB.stdout).job.status, "cancelled");
+});
+
+test("cancel --all without session id reports no-session-id workspace scope", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  // Seed two session-tagged jobs via env, then cancel with no session id.
+  const envA = fakeGrokEnv(state, {
+    FAKE_GROK_DELAY_MS: "10000",
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-ns-a"
+  });
+  const envB = fakeGrokEnv(state, {
+    FAKE_GROK_DELAY_MS: "10000",
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-ns-b"
+  });
+  const envNoSession = fakeGrokEnv(state);
+
+  const launchedA = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "no-session cancel a"],
+    { env: envA, cwd: repo }
+  );
+  const launchedB = runCompanion(
+    ["task", "--background", "--json", "--cwd", repo, "no-session cancel b"],
+    { env: envB, cwd: repo }
+  );
+  assert.equal(launchedA.status, 0, launchedA.stderr);
+  assert.equal(launchedB.status, 0, launchedB.stderr);
+  const idA = JSON.parse(launchedA.stdout).jobId;
+  const idB = JSON.parse(launchedB.stdout).jobId;
+  await waitForJob(repo, envA, idA, (job) => job.status === "running");
+  await waitForJob(repo, envB, idB, (job) => job.status === "running");
+
+  const cancelled = runCompanion(["cancel", "--all", "--json", "--cwd", repo], {
+    env: envNoSession,
+    cwd: repo,
+    timeout: 30_000
+  });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  const payload = JSON.parse(cancelled.stdout);
+  assert.equal(payload.scope, "no-session-id");
+  assert.equal(payload.claudeSessionId, null);
+  assert.equal(payload.requestedCount, 2);
+  assert.equal(payload.cancelledCount, 2);
+  const cancelledIds = new Set(payload.results.map((entry) => entry.jobId));
+  assert.ok(cancelledIds.has(idA));
+  assert.ok(cancelledIds.has(idB));
 });
 
 test("status --wait --with-result returns the finished job result", async (t) => {
@@ -996,4 +1125,5 @@ test("usage lists new commands and task resume flags", (t) => {
   assert.match(response.stdout, /\brerun\b/);
   assert.match(response.stdout, /--with-result/);
   assert.match(response.stdout, /cancel .*--all/);
+  assert.match(response.stdout, /--all-sessions/);
 });
