@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.2 - 2026-07-30
+
+### Fixes
+
+- Immediate background cancel is more reliable when the worker is still starting.
+  `cancelTrackedJob` retries terminate/liveness checks with a bounded backoff,
+  waits briefly for PID publication, and only marks `cancelled` after signal
+  delivery or a confirmed exit (process was observed alive, then gone).
+  Unconfirmed cancels stay `cancel-requested` / `cancel-failed` for later
+  reclaim; `status` reconcile finishes pending cancels as `cancelled` when the
+  PID is dead without inventing `terminationDelivered: true`.
+- `enqueue` always publishes the spawn PID when the worker has not written one
+  yet, including the race where the job flips to `running` before the launcher
+  records `child.pid`.
+
 ## 0.5.1 - 2026-07-30
 
 ### Fixes

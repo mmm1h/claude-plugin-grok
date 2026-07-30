@@ -64,6 +64,7 @@ import {
   resolveJobFile,
   resolveStateDir,
   setConfig,
+  updateJobFile,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -591,11 +592,24 @@ function enqueue(job) {
   upsertJob(job.workspaceRoot, indexJobRecord(queued));
   appendLogLine(logPath, "Queued for background execution.");
   const child = spawnWorker(job.cwd, job.id);
-  const latest = readStoredJob(job.workspaceRoot, job.id);
-  if (latest?.status === "queued") {
-    const withPid = { ...latest, pid: child.pid ?? null };
-    writeJobFile(job.workspaceRoot, job.id, withPid);
-    upsertJob(job.workspaceRoot, indexJobRecord(withPid));
+  // Always publish the spawn PID when the worker has not written one yet.
+  // Previously this only ran while status stayed "queued"; if the worker raced
+  // to "running" without a durable pid (or cancel ran in the gap), cancel had
+  // no target. Prefer the worker's own pid when already present.
+  const spawnedPid = Number.isInteger(child.pid) && child.pid > 0 ? child.pid : null;
+  if (spawnedPid != null) {
+    const withPid = updateJobFile(job.workspaceRoot, job.id, (latest) => {
+      if (!latest || (Number.isInteger(latest.pid) && latest.pid > 0)) {
+        return null;
+      }
+      if (!["queued", "running"].includes(latest.status)) {
+        return null;
+      }
+      return { ...latest, pid: spawnedPid };
+    });
+    if (withPid && Number.isInteger(withPid.pid) && withPid.pid > 0) {
+      upsertJob(job.workspaceRoot, indexJobRecord(withPid));
+    }
   }
   return {
     jobId: job.id,

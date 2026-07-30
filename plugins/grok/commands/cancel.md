@@ -15,5 +15,5 @@ Cancellation targets:
 - `--kind <kind>` filters which active jobs are eligible (works with a single auto-selected job or with `--all`).
 - Scope defaults to the current Claude session; companion job matching follows the same session filter as status unless broader resolution applies.
 
-Cancellation is terminal only after a signal is delivered or the PID is confirmed exited. A failed termination is reported as `cancel-failed`; it is never presented as cancelled.
+Cancellation is terminal only after a signal is delivered or the PID is confirmed exited (observed alive, then gone). Cancel retries briefly while a worker may still be starting or publishing its PID. Unconfirmed attempts remain `cancel-requested` (reclaimable by status reconcile) or `cancel-failed` if the process is still running; they are never presented as cancelled.
 `--json` selects structured JSON (single-job or bulk `results` list).

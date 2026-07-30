@@ -318,6 +318,38 @@ test("reconcileOrphanedJob is a no-op when the process is still alive", (t) => {
   assert.equal(result.status, "running");
 });
 
+test("reconcileOrphanedJob finishes cancel-requested as cancelled when the pid is dead", (t) => {
+  const { repo } = withStateHome(t);
+  const job = {
+    id: "task-cancel-pending",
+    kind: "task",
+    status: "running",
+    phase: "cancel-requested",
+    pid: 4242,
+    cwd: repo,
+    workspaceRoot: repo,
+    logPath: path.join(repo, "cancel-pending.log"),
+    cancelRequestedAt: "2026-07-30T10:00:00.000Z",
+    terminationDelivered: false,
+    updatedAt: "2026-07-30T10:00:00.000Z"
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: {}, jobs: [job] });
+
+  const result = reconcileOrphanedJob(repo, job, { isProcessAliveImpl: () => false });
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.phase, "cancelled");
+  assert.equal(result.pid, null);
+  assert.ok(result.cancelledAt);
+  assert.equal(result.cancelRequestedAt, "2026-07-30T10:00:00.000Z");
+  // Honest delivery: reconcile confirms exit, not signal delivery.
+  assert.equal(result.terminationDelivered, false);
+  assert.equal(result.terminationMethod, "already-exited");
+  const stored = readJobFile(resolveJobFile(repo, job.id));
+  assert.equal(stored.status, "cancelled");
+});
+
 test("SessionEnd hook timeout is raised to 60 seconds for multi-job cancel", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8"));
   assert.equal(hooks.hooks.SessionEnd[0].hooks[0].timeout, 60);

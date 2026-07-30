@@ -35,6 +35,24 @@ export const PROGRESS_PREVIEW_TAIL_BYTES = 64 * 1024;
 export const DEFAULT_LOG_TAIL_LINES = 80;
 /** Exit code when status/result --wait times out while the job is still active. */
 export const WAIT_TIMEOUT_EXIT_CODE = 124;
+/**
+ * Backoff between cancel terminate attempts while a worker may still be starting
+ * or the first taskkill/signal races process creation. Bounded so cancel stays
+ * interactive (sum ≈ 375ms with the default schedule).
+ */
+export const CANCEL_TERMINATE_RETRY_DELAYS_MS = [25, 50, 100, 200];
+
+const cancelRetryWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(milliseconds) {
+  if (milliseconds > 0) {
+    Atomics.wait(cancelRetryWaiter, 0, 0, milliseconds);
+  }
+}
+
+function isValidPid(pid) {
+  return Number.isInteger(pid) && pid > 0;
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -169,8 +187,37 @@ export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
   if (!["queued", "running"].includes(stored.status) || (stored.pid && alive(stored.pid))) {
     return stored;
   }
-  const message = `Tracked Grok process ${job.pid} exited before the job reached a terminal state.`;
   const { request: _request, ...base } = stored;
+  const cancelWasRequested = Boolean(
+    stored.cancelRequestedAt
+    || stored.phase === "cancel-requested"
+    || stored.phase === "cancel-failed"
+  );
+  // Explicit cancel left pending (budget, startup race, failed delivery) should
+  // finish as cancelled once the worker is confirmed gone — not as a generic
+  // process-exited failure that hides the user's cancel intent.
+  if (cancelWasRequested) {
+    const cancelledAt = nowIso();
+    const cancelled = persistJob(workspaceRoot, {
+      ...base,
+      status: "cancelled",
+      phase: stored.phase === "session-ended" ? "session-ended" : "cancelled",
+      pid: null,
+      completedAt: cancelledAt,
+      cancelledAt: stored.cancelledAt ?? cancelledAt,
+      cancelRequestedAt: stored.cancelRequestedAt ?? cancelledAt,
+      terminationMethod: stored.terminationMethod ?? "already-exited",
+      terminationDelivered: stored.terminationDelivered === true,
+      resumable: stored.kind === "task" && Boolean(stored.sessionConfirmed),
+      errorMessage: null
+    });
+    appendLogLine(
+      cancelled.logPath,
+      `Cancelled after reconcile: tracked process ${job.pid} exited following a cancel request.`
+    );
+    return cancelled;
+  }
+  const message = `Tracked Grok process ${job.pid} exited before the job reached a terminal state.`;
   const failed = persistJob(workspaceRoot, {
     ...base,
     status: "failed",
@@ -255,24 +302,95 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
     };
   }
 
+  const alive = options.isProcessAliveImpl ?? isProcessAlive;
+  const terminate = options.terminateImpl ?? terminateProcessTree;
+  const sleep = options.sleepImpl ?? sleepSyncMs;
+  const retryDelays = options.retryDelaysMs ?? CANCEL_TERMINATE_RETRY_DELAYS_MS;
+  const maxAttempts = Math.max(1, retryDelays.length + 1);
+
   let termination = { attempted: false, delivered: false, method: null };
   let terminationError = null;
-  try {
-    termination = (options.terminateImpl ?? terminateProcessTree)(requested.pid, {
-      cwd: requested.cwd,
-      env: options.env
-    });
-  } catch (error) {
-    terminationError = error instanceof Error ? error.message : String(error);
-  }
-  const alive = options.isProcessAliveImpl ?? isProcessAlive;
-  const exited = !alive(requested.pid);
-  const cancelled = Boolean(termination.delivered || exited);
-  const method = termination.method ?? (exited ? "already-exited" : null);
+  let lastPid = isValidPid(requested.pid) ? requested.pid : null;
+  let sawAlive = false;
+  let confirmedExit = false;
+  let latestSnapshot = requested;
 
-  if (cancelled) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    latestSnapshot = readStoredJob(workspaceRoot, job.id) ?? latestSnapshot;
+    if (latestSnapshot.status === "cancelled") {
+      return {
+        job: latestSnapshot,
+        previousStatus: stored.status,
+        status: "cancelled",
+        delivered: Boolean(latestSnapshot.terminationDelivered),
+        method: latestSnapshot.terminationMethod ?? null,
+        errorMessage: null
+      };
+    }
+    if (isValidPid(latestSnapshot.pid)) {
+      lastPid = latestSnapshot.pid;
+    }
+
+    if (!isValidPid(lastPid)) {
+      // Detached worker may still be publishing its PID.
+      if (attempt < maxAttempts - 1) {
+        sleep(retryDelays[attempt] ?? retryDelays[retryDelays.length - 1] ?? 25);
+      }
+      continue;
+    }
+
+    const currentlyAlive = alive(lastPid);
+    if (currentlyAlive) {
+      sawAlive = true;
+    } else if (sawAlive) {
+      // Observed live earlier in this cancel; now gone → confirmed exit.
+      confirmedExit = true;
+      break;
+    }
+
+    try {
+      const result = terminate(lastPid, {
+        cwd: latestSnapshot.cwd ?? requested.cwd,
+        env: options.env
+      });
+      termination = {
+        attempted: true,
+        delivered: Boolean(result?.delivered),
+        method: result?.method ?? null,
+        ...(result && typeof result === "object" ? result : {})
+      };
+      termination.attempted = true;
+      termination.delivered = Boolean(result?.delivered);
+    } catch (error) {
+      terminationError = error instanceof Error ? error.message : String(error);
+      termination = { attempted: true, delivered: false, method: termination.method ?? null };
+    }
+
+    if (termination.delivered) {
+      break;
+    }
+
+    // After a kill attempt, re-check liveness. Only treat "gone" as success when
+    // we previously saw the process alive — a starting Windows worker can look
+    // missing to both taskkill and kill(pid,0) before it is fully up.
+    if (!alive(lastPid)) {
+      if (sawAlive) {
+        confirmedExit = true;
+        break;
+      }
+    } else {
+      sawAlive = true;
+    }
+
+    if (attempt < maxAttempts - 1) {
+      sleep(retryDelays[attempt] ?? retryDelays[retryDelays.length - 1] ?? 25);
+    }
+  }
+
+  if (termination.delivered || confirmedExit) {
     const cancelledAt = nowIso();
-    const { request: _request, ...base } = requested;
+    const method = termination.method ?? (confirmedExit ? "already-exited" : null);
+    const { request: _request, ...base } = latestSnapshot;
     const final = persistJob(workspaceRoot, {
       ...base,
       status: "cancelled",
@@ -280,25 +398,95 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
       pid: null,
       completedAt: cancelledAt,
       cancelledAt,
+      cancelRequestedAt: latestSnapshot.cancelRequestedAt ?? requested.cancelRequestedAt ?? cancelledAt,
       terminationMethod: method,
+      // Honest delivery bit: never invent true when only exit was observed.
       terminationDelivered: Boolean(termination.delivered),
-      resumable: requested.kind === "task" && Boolean(requested.sessionConfirmed),
+      resumable: latestSnapshot.kind === "task" && Boolean(latestSnapshot.sessionConfirmed),
       errorMessage: null
     });
-    appendLogLine(final.logPath, `Cancelled via ${method ?? "confirmed process exit"}; signal delivered: ${Boolean(termination.delivered)}.`);
-    return { job: final, previousStatus: stored.status, status: "cancelled", delivered: Boolean(termination.delivered), method, errorMessage: null };
+    appendLogLine(
+      final.logPath,
+      `Cancelled via ${method ?? "confirmed process exit"}; signal delivered: ${Boolean(termination.delivered)}.`
+    );
+    return {
+      job: final,
+      previousStatus: stored.status,
+      status: "cancelled",
+      delivered: Boolean(termination.delivered),
+      method,
+      errorMessage: null
+    };
   }
 
-  const errorMessage = terminationError || `Could not terminate process ${requested.pid}; it is still running.`;
-  const failed = persistJob(workspaceRoot, {
-    ...requested,
-    phase: "cancel-failed",
+  // Unconfirmed: keep reclaimable cancel-requested (or cancel-failed if still live).
+  latestSnapshot = readStoredJob(workspaceRoot, job.id) ?? latestSnapshot;
+  if (isValidPid(latestSnapshot.pid)) {
+    lastPid = latestSnapshot.pid;
+  }
+
+  if (!isValidPid(lastPid)) {
+    const pendingMessage = "Worker PID not available yet; left cancel-requested for later reclaim.";
+    const pending = persistJob(workspaceRoot, {
+      ...latestSnapshot,
+      phase: "cancel-requested",
+      terminationMethod: null,
+      terminationDelivered: null,
+      errorMessage: pendingMessage
+    });
+    appendLogLine(pending.logPath, `Cancellation pending: ${pendingMessage}`);
+    return {
+      job: pending,
+      previousStatus: stored.status,
+      status: "cancel-requested",
+      delivered: false,
+      method: null,
+      errorMessage: pendingMessage
+    };
+  }
+
+  if (alive(lastPid)) {
+    const errorMessage = terminationError
+      || `Could not terminate process ${lastPid}; it is still running.`;
+    const failed = persistJob(workspaceRoot, {
+      ...latestSnapshot,
+      phase: "cancel-failed",
+      pid: lastPid,
+      terminationMethod: termination.method ?? null,
+      terminationDelivered: false,
+      errorMessage
+    });
+    appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
+    return {
+      job: failed,
+      previousStatus: stored.status,
+      status: "cancel-failed",
+      delivered: false,
+      method: termination.method ?? null,
+      errorMessage
+    };
+  }
+
+  // PID never observed alive and kill never reported delivery — do not claim
+  // cancelled (startup race). Leave cancel-requested for status reconcile.
+  const uncertainMessage = `Could not confirm process ${lastPid} during cancel; left cancel-requested for later reclaim.`;
+  const uncertain = persistJob(workspaceRoot, {
+    ...latestSnapshot,
+    phase: "cancel-requested",
+    pid: lastPid,
     terminationMethod: termination.method ?? null,
     terminationDelivered: false,
-    errorMessage
+    errorMessage: uncertainMessage
   });
-  appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
-  return { job: failed, previousStatus: stored.status, status: "cancel-failed", delivered: false, method: termination.method ?? null, errorMessage };
+  appendLogLine(uncertain.logPath, `Cancellation pending: ${uncertainMessage}`);
+  return {
+    job: uncertain,
+    previousStatus: stored.status,
+    status: "cancel-requested",
+    delivered: false,
+    method: termination.method ?? null,
+    errorMessage: uncertainMessage
+  };
 }
 
 function budgetExhaustedResult(workspaceRoot, job, message) {
